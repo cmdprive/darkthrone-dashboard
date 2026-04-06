@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DarkThrone Intelligence</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background-color: #0f172a; color: #f1f5f9; font-family: 'Inter', sans-serif; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; }
+    </style>
+</head>
+<body class="p-8">
+    <div class="max-w-6xl mx-auto">
+        <div class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-3xl font-bold text-emerald-400">🛡️ DarkThrone Analytics</h1>
+                <p class="text-slate-500 text-sm mt-1">Last updated: <span id="last-updated">-</span> &nbsp;|&nbsp; Next refresh in: <span id="countdown" class="text-emerald-400">-</span></p>
+            </div>
+            <select id="playerFilter" class="bg-slate-800 border border-slate-700 p-2 rounded w-64" onchange="updateDashboard(this.value)">
+                <option value="">Select a Player...</option>
+            </select>
+        </div>
+
+        <div class="grid grid-cols-3 gap-6 mb-8">
+            <div class="card p-6 text-center">
+                <p class="text-slate-400 text-sm">Target</p>
+                <p id="current-player-name" class="text-2xl font-bold text-emerald-400">-</p>
+            </div>
+            <div class="card p-6 text-center">
+                <p class="text-slate-400 text-sm">Peak Gold</p>
+                <p id="stat-peak" class="text-2xl font-bold">0</p>
+            </div>
+            <div class="card p-6 text-center">
+                <p class="text-slate-400 text-sm">Scrapes</p>
+                <p id="total-entries" class="text-2xl font-bold">0</p>
+            </div>
+        </div>
+
+        <div class="card p-6">
+            <canvas id="goldChart" height="120"></canvas>
+        </div>
+    </div>
+
+    <script>
+        // DATA PLACEHOLDER - Scraper will overwrite this
+        const rawData = {};
+
+        let chart;
+
+        document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+
+        // Build sorted player list
+        const playerNames = Object.keys(rawData).sort();
+
+        // Fill dropdown
+        const select = document.getElementById('playerFilter');
+        const savedPlayer = localStorage.getItem('dt_selected_player');
+        playerNames.forEach(name => {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.innerHTML = name;
+            select.appendChild(opt);
+        });
+
+        // On load: restore last saved player, or fall back to first player in list
+        const initialPlayer = (savedPlayer && rawData[savedPlayer])
+            ? savedPlayer
+            : playerNames[0];
+
+        if (initialPlayer) {
+            select.value = initialPlayer;
+            updateDashboard(initialPlayer);
+        }
+
+        function updateDashboard(playerName) {
+            if (!playerName || !rawData[playerName]) return;
+            localStorage.setItem('dt_selected_player', playerName);
+            const data = rawData[playerName];
+
+            const times = data.map(d => d.timestamp);
+            const golds = data.map(d => d.gold);
+            const hps   = data.map(d => d.hp);
+
+            document.getElementById('current-player-name').textContent = playerName;
+            document.getElementById('total-entries').textContent = data.length;
+            document.getElementById('stat-peak').textContent = Math.max(...golds).toLocaleString();
+
+            if (chart) chart.destroy();
+
+            chart = new Chart(document.getElementById('goldChart'), {
+                type: 'line',
+                data: {
+                    labels: times,
+                    datasets: [
+                        { label: 'Gold',    data: golds, borderColor: '#10b981', yAxisID: 'y',  tension: 0.3, fill: false },
+                        { label: 'Fort HP', data: hps,   borderColor: '#ef4444', borderDash: [5,5], yAxisID: 'y1', tension: 0.3, fill: false }
+                    ]
+                },
+                options: {
+                    scales: {
+                        y:  { type: 'linear', position: 'left',  title: { display: true, text: 'Gold' },    grid: { color: '#334155' } },
+                        y1: { type: 'linear', position: 'right', title: { display: true, text: 'Fort HP' }, grid: { drawOnChartArea: false } }
+                    },
+                    plugins: { legend: { labels: { color: '#f1f5f9' } } }
+                }
+            });
+        }
+
+        // --- AUTO REFRESH aligned to :00 and :30 ---
+        function msUntilNextHalfHour() {
+            const now = new Date();
+            const secondsPast = (now.getMinutes() % 30) * 60 + now.getSeconds();
+            return (30 * 60 - secondsPast) * 1000;
+        }
+
+        function startCountdown(ms) {
+            let remaining = Math.floor(ms / 1000);
+            const el = document.getElementById('countdown');
+            const interval = setInterval(() => {
+                remaining--;
+                const m = String(Math.floor(remaining / 60)).padStart(2, '0');
+                const s = String(remaining % 60).padStart(2, '0');
+                el.textContent = `${m}:${s}`;
+                if (remaining <= 0) {
+                    clearInterval(interval);
+                    el.textContent = 'Refreshing...';
+                    location.reload();
+                }
+            }, 1000);
+        }
+
+        startCountdown(msUntilNextHalfHour());
+    </script>
+</body>
+</html>
