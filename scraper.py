@@ -56,10 +56,22 @@ def update_dashboard():
                     history[name] = []
                 g = re.sub(r"\D", "", row.get("Gold", "0"))
                 h = re.sub(r"\D", "", row.get("FortHP", "0"))
+                hmax = re.sub(r"\D", "", row.get("FortMaxHP", "0"))
                 history[name].append({
-                    "timestamp": row["Timestamp"],
-                    "gold": int(g) if g else 0,
-                    "hp": int(h) if h else 0,
+                    "timestamp":  row["Timestamp"],
+                    "player_id":  row.get("PlayerID", ""),
+                    "level":      int(row.get("Level", "0") or 0),
+                    "race":       row.get("Race", ""),
+                    "gold":       int(g) if g else 0,
+                    "hp":         int(h) if h else 0,
+                    "hp_max":     int(hmax) if hmax else 0,
+                    "fort_pct":   int(row.get("FortPct", "0") or 0),
+                    "turns":      int(row.get("Turns", "0") or 0),
+                    "in_range":   row.get("InRange", "0") == "1",
+                    "is_bot":     row.get("IsBot", "0") == "1",
+                    "is_clan":    row.get("IsClanMember", "0") == "1",
+                    "is_friend":  row.get("IsFriend", "0") == "1",
+                    "is_hitlist": row.get("IsHitlist", "0") == "1",
                 })
 
     with open(DASHBOARD_FILE, "r", encoding="utf-8") as f:
@@ -83,7 +95,11 @@ def ensure_csv_header():
     """Write the CSV header if the file does not exist yet."""
     if not os.path.isfile(DATA_FILE):
         with open(DATA_FILE, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["Timestamp", "Player", "Gold", "FortHP"])
+            csv.writer(f).writerow([
+                "Timestamp", "PlayerID", "Player", "Level", "Race",
+                "Gold", "FortHP", "FortMaxHP", "FortPct",
+                "Turns", "InRange", "IsBot", "IsClanMember", "IsFriend", "IsHitlist"
+            ])
 
 
 def load_existing_keys():
@@ -150,40 +166,71 @@ def scrape():
                 print(f"  [DEBUG] Player rows found: {len(player_rows)}")
 
             for row in player_rows:
-                # Read directly from data attributes — fast and reliable
-                name  = row.get_attribute("data-name") or ""
+                # --- Player ID from profile link href ---
+                link_el = row.query_selector("a.player-link")
+                href = link_el.get_attribute("href") if link_el else ""
+                id_match = re.search(r"/player/(\d+)", href)
+                player_id = id_match.group(1) if id_match else ""
+
+                # --- Core data attributes on the <tr> ---
+                level = row.get_attribute("data-level") or ""
+                race  = row.get_attribute("data-race") or ""
                 gold  = row.get_attribute("data-gold") or "0"
-                fort  = row.get_attribute("data-fort") or "0"   # fort % (0-100)
+                fort_pct = row.get_attribute("data-fort") or "0"
 
-                # Get the display name (properly cased) from the <span> inside the link
+                # --- Display name (properly cased) ---
                 name_span = row.query_selector("a.player-link span:last-child")
-                if name_span:
-                    name = name_span.inner_text().replace("(YOU)", "").strip()
-
+                name = name_span.inner_text().replace("(YOU)", "").strip() if name_span else ""
+                if not name:
+                    name = row.get_attribute("data-name") or ""
                 if not name:
                     continue
 
                 page_names.append(name)
 
-                # Fort HP: the fort-bar div carries a title like "800/1000 HP"
-                # which gives us the exact current/max values
+                # --- Fort HP current and max from fort-bar title ("800/1000 HP") ---
+                fort_hp = fort_pct
+                fort_max_hp = "0"
                 fort_bar = row.query_selector(".fort-bar")
                 if fort_bar:
                     title = fort_bar.get_attribute("title") or ""
-                    # title format: "800/1000 HP"
                     hp_match = re.match(r"(\d+)/(\d+)", title)
-                    hp = hp_match.group(1) if hp_match else fort
-                else:
-                    hp = fort
+                    if hp_match:
+                        fort_hp     = hp_match.group(1)
+                        fort_max_hp = hp_match.group(2)
+
+                # --- Turns (6th td — shows number if visible, else "-") ---
+                tds = row.query_selector_all("td")
+                turns = tds[5].inner_text().strip() if len(tds) > 5 else "-"
+                turns = turns if turns != "-" else "0"
+
+                # --- Attack range status (7th td) ---
+                in_range = "0"
+                if len(tds) > 6:
+                    action_text = tds[6].inner_text().strip()
+                    in_range = "0" if "out of range" in action_text.lower() else "1"
+
+                # --- Badges ---
+                is_bot        = "1" if "[bot]" in name.lower() else "0"
+                is_clan       = "1" if row.query_selector(".clan-badge") else "0"
+                is_friend     = "1" if row.query_selector(".friend-badge") else "0"
+                is_hitlist    = "1" if row.query_selector(".hitlist-badge") else "0"
 
                 if DEBUG_SELECTORS:
-                    print(f"  [DEBUG] name={name!r}  gold={gold!r}  hp={hp!r}")
+                    print(f"  [DEBUG] {name!r} id={player_id} lv={level} race={race} "
+                          f"gold={gold} hp={fort_hp}/{fort_max_hp} turns={turns} "
+                          f"range={in_range} bot={is_bot} clan={is_clan} "
+                          f"friend={is_friend} hitlist={is_hitlist}")
 
                 if (today, name) in existing_keys:
                     continue
 
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                found_on_page.append([timestamp, name, gold, hp])
+                found_on_page.append([
+                    timestamp, player_id, name, level, race,
+                    gold, fort_hp, fort_max_hp, fort_pct,
+                    turns, in_range, is_bot, is_clan, is_friend, is_hitlist
+                ])
                 existing_keys.add((today, name))
 
             # --- END DETECTION ---

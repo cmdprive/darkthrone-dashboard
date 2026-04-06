@@ -8,129 +8,240 @@
     <style>
         body { background-color: #0f172a; color: #f1f5f9; font-family: 'Inter', sans-serif; }
         .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; margin-right: 4px; }
+        .badge-bot    { background: #7c3aed; color: #fff; }
+        .badge-clan   { background: #0369a1; color: #fff; }
+        .badge-friend { background: #065f46; color: #fff; }
+        .badge-hit    { background: #991b1b; color: #fff; }
+        .badge-range  { background: #854d0e; color: #fff; }
+        table { border-collapse: collapse; width: 100%; }
+        thead th { background: #0f172a; padding: 8px 12px; text-align: left; font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: .05em; }
+        tbody td { padding: 8px 12px; border-bottom: 1px solid #1e293b; font-size: 13px; }
+        tbody tr:hover { background: #1e3a5f22; }
     </style>
 </head>
-<body class="p-8">
-    <div class="max-w-6xl mx-auto">
-        <div class="flex justify-between items-center mb-8">
-            <div>
-                <h1 class="text-3xl font-bold text-emerald-400">🛡️ DarkThrone Analytics</h1>
-                <p class="text-slate-500 text-sm mt-1">Last updated: <span id="last-updated">-</span> &nbsp;|&nbsp; Next refresh in: <span id="countdown" class="text-emerald-400">-</span></p>
-            </div>
-            <select id="playerFilter" class="bg-slate-800 border border-slate-700 p-2 rounded w-64" onchange="updateDashboard(this.value)">
+<body class="p-6">
+<div class="max-w-7xl mx-auto">
+
+    <!-- Header -->
+    <div class="flex justify-between items-start mb-6">
+        <div>
+            <h1 class="text-3xl font-bold text-emerald-400">🛡️ DarkThrone Intelligence</h1>
+            <p class="text-slate-500 text-sm mt-1">
+                Last updated: <span id="last-updated">-</span>
+                &nbsp;|&nbsp; Next refresh in: <span id="countdown" class="text-emerald-400 font-mono">-</span>
+            </p>
+        </div>
+        <div class="flex gap-3 items-center">
+            <input id="searchBox" type="text" placeholder="Search player..." 
+                class="bg-slate-800 border border-slate-700 p-2 rounded w-48 text-sm" 
+                oninput="filterPlayers(this.value)">
+            <select id="playerFilter" class="bg-slate-800 border border-slate-700 p-2 rounded w-56 text-sm" onchange="selectPlayer(this.value)">
                 <option value="">Select a Player...</option>
             </select>
         </div>
+    </div>
 
-        <div class="grid grid-cols-3 gap-6 mb-8">
-            <div class="card p-6 text-center">
-                <p class="text-slate-400 text-sm">Target</p>
-                <p id="current-player-name" class="text-2xl font-bold text-emerald-400">-</p>
-            </div>
-            <div class="card p-6 text-center">
-                <p class="text-slate-400 text-sm">Peak Gold</p>
-                <p id="stat-peak" class="text-2xl font-bold">0</p>
-            </div>
-            <div class="card p-6 text-center">
-                <p class="text-slate-400 text-sm">Scrapes</p>
-                <p id="total-entries" class="text-2xl font-bold">0</p>
-            </div>
+    <!-- Stat cards -->
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+        <div class="card p-4 text-center">
+            <p class="text-slate-400 text-xs mb-1">Player</p>
+            <p id="stat-name" class="text-lg font-bold text-emerald-400 truncate">-</p>
         </div>
-
-        <div class="card p-6">
-            <canvas id="goldChart" height="120"></canvas>
+        <div class="card p-4 text-center">
+            <p class="text-slate-400 text-xs mb-1">Level / Race</p>
+            <p id="stat-level" class="text-lg font-bold">-</p>
+        </div>
+        <div class="card p-4 text-center">
+            <p class="text-slate-400 text-xs mb-1">Peak Gold</p>
+            <p id="stat-peak" class="text-lg font-bold text-yellow-400">0</p>
+        </div>
+        <div class="card p-4 text-center">
+            <p class="text-slate-400 text-xs mb-1">Gold/Scrape Avg</p>
+            <p id="stat-avg" class="text-lg font-bold text-blue-400">0</p>
+        </div>
+        <div class="card p-4 text-center">
+            <p class="text-slate-400 text-xs mb-1">Scrapes</p>
+            <p id="stat-scrapes" class="text-lg font-bold">0</p>
         </div>
     </div>
 
-    <script>
-        // DATA PLACEHOLDER - Scraper will overwrite this
-        const rawData = {};
+    <!-- Badges row -->
+    <div id="badge-row" class="mb-6 flex gap-2 flex-wrap"></div>
 
-        let chart;
+    <!-- Charts -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+        <div class="card p-4">
+            <h2 class="text-sm font-semibold text-slate-400 mb-3">Gold Over Time</h2>
+            <canvas id="goldChart" height="160"></canvas>
+        </div>
+        <div class="card p-4">
+            <h2 class="text-sm font-semibold text-slate-400 mb-3">Fort HP Over Time</h2>
+            <canvas id="fortChart" height="160"></canvas>
+        </div>
+    </div>
 
-        document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+    <!-- All players table -->
+    <div class="card p-4">
+        <h2 class="text-sm font-semibold text-slate-400 mb-3">All Players — Latest Snapshot</h2>
+        <div class="overflow-x-auto">
+            <table id="playersTable">
+                <thead>
+                    <tr>
+                        <th>Player</th><th>Level</th><th>Race</th>
+                        <th>Gold</th><th>Fort HP</th><th>Fort Max</th><th>Fort %</th>
+                        <th>In Range</th><th>Tags</th><th>Scrapes</th>
+                    </tr>
+                </thead>
+                <tbody id="playersBody"></tbody>
+            </table>
+        </div>
+    </div>
 
-        // Build sorted player list
-        const playerNames = Object.keys(rawData).sort();
+</div>
+<script>
+    // DATA PLACEHOLDER - Scraper will overwrite this
+    const rawData = {};
 
-        // Fill dropdown
-        const select = document.getElementById('playerFilter');
-        const savedPlayer = localStorage.getItem('dt_selected_player');
-        playerNames.forEach(name => {
-            const opt = document.createElement('option');
-            opt.value = name;
-            opt.innerHTML = name;
-            select.appendChild(opt);
+    let goldChart, fortChart;
+
+    document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+
+    const playerNames = Object.keys(rawData).sort();
+    const select = document.getElementById('playerFilter');
+    const savedPlayer = localStorage.getItem('dt_selected_player');
+
+    playerNames.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = opt.textContent = name;
+        select.appendChild(opt);
+    });
+
+    // Build the all-players table
+    buildTable(playerNames);
+
+    // Auto-select player
+    const initialPlayer = (savedPlayer && rawData[savedPlayer]) ? savedPlayer : playerNames[0];
+    if (initialPlayer) { select.value = initialPlayer; selectPlayer(initialPlayer); }
+
+    function latest(name) { const d = rawData[name]; return d[d.length - 1]; }
+
+    function buildTable(names) {
+        const tbody = document.getElementById('playersBody');
+        tbody.innerHTML = '';
+        names.forEach(name => {
+            const l = latest(name);
+            const d = rawData[name];
+            const goldChange = d.length > 1 ? l.gold - d[d.length - 2].gold : 0;
+            const changeColor = goldChange > 0 ? 'text-emerald-400' : goldChange < 0 ? 'text-red-400' : 'text-slate-400';
+            const changeStr = goldChange > 0 ? `+${goldChange.toLocaleString()}` : goldChange.toLocaleString();
+            const tags = [
+                l.is_bot     ? '<span class="badge badge-bot">BOT</span>'      : '',
+                l.is_clan    ? '<span class="badge badge-clan">CLAN</span>'    : '',
+                l.is_friend  ? '<span class="badge badge-friend">FRIEND</span>': '',
+                l.is_hitlist ? '<span class="badge badge-hit">🎯 HIT</span>'  : '',
+                l.in_range   ? '<span class="badge badge-range">IN RANGE</span>': '',
+            ].join('');
+            const fortColor = l.fort_pct >= 75 ? '#10b981' : l.fort_pct >= 40 ? '#f59e0b' : '#ef4444';
+            const tr = document.createElement('tr');
+            tr.style.cursor = 'pointer';
+            tr.onclick = () => { select.value = name; selectPlayer(name); window.scrollTo({top:0, behavior:'smooth'}); };
+            tr.innerHTML = `
+                <td class="font-medium">${name}</td>
+                <td>${l.level}</td>
+                <td class="capitalize">${l.race}</td>
+                <td>${l.gold.toLocaleString()} <span class="text-xs ${changeColor}">${changeStr}</span></td>
+                <td>${l.hp.toLocaleString()}</td>
+                <td>${l.hp_max.toLocaleString()}</td>
+                <td><span style="color:${fortColor}">${l.fort_pct}%</span></td>
+                <td>${l.in_range ? '<span class="text-emerald-400">✓</span>' : '<span class="text-slate-500">✗</span>'}</td>
+                <td>${tags}</td>
+                <td>${d.length}</td>`;
+            tbody.appendChild(tr);
+        });
+    }
+
+    function filterPlayers(query) {
+        const q = query.toLowerCase();
+        const filtered = playerNames.filter(n => n.toLowerCase().includes(q));
+        buildTable(filtered);
+    }
+
+    function selectPlayer(name) {
+        if (!name || !rawData[name]) return;
+        localStorage.setItem('dt_selected_player', name);
+        const data = rawData[name];
+        const times = data.map(d => d.timestamp);
+        const golds = data.map(d => d.gold);
+        const hps   = data.map(d => d.hp);
+        const l = latest(name);
+
+        // Stat cards
+        document.getElementById('stat-name').textContent = name;
+        document.getElementById('stat-level').textContent = `Lvl ${l.level} ${l.race}`;
+        document.getElementById('stat-peak').textContent = Math.max(...golds).toLocaleString();
+        document.getElementById('stat-scrapes').textContent = data.length;
+        const avgGold = data.length > 1
+            ? Math.round((golds[golds.length-1] - golds[0]) / (golds.length - 1))
+            : 0;
+        document.getElementById('stat-avg').textContent = (avgGold >= 0 ? '+' : '') + avgGold.toLocaleString();
+
+        // Badges
+        const badges = [
+            l.is_bot     ? '<span class="badge badge-bot">BOT</span>'      : '',
+            l.is_clan    ? '<span class="badge badge-clan">CLAN</span>'    : '',
+            l.is_friend  ? '<span class="badge badge-friend">FRIEND</span>': '',
+            l.is_hitlist ? '<span class="badge badge-hit">🎯 ON HIT LIST</span>': '',
+            l.in_range   ? '<span class="badge badge-range">IN YOUR RANGE</span>': '',
+        ].join('');
+        document.getElementById('badge-row').innerHTML = badges;
+
+        // Charts
+        const chartOpts = (label, color) => ({
+            type: 'line',
+            options: {
+                responsive: true,
+                plugins: { legend: { labels: { color: '#f1f5f9', font: { size: 11 } } } },
+                scales: {
+                    x: { ticks: { color: '#64748b', maxTicksLimit: 6, font: { size: 10 } }, grid: { color: '#1e293b' } },
+                    y: { ticks: { color: '#64748b' }, grid: { color: '#334155' }, title: { display: true, text: label, color: '#94a3b8' } }
+                }
+            }
         });
 
-        // On load: restore last saved player, or fall back to first player in list
-        const initialPlayer = (savedPlayer && rawData[savedPlayer])
-            ? savedPlayer
-            : playerNames[0];
+        if (goldChart) goldChart.destroy();
+        goldChart = new Chart(document.getElementById('goldChart'), {
+            ...chartOpts('Gold', '#10b981'),
+            data: { labels: times, datasets: [{ label: 'Gold', data: golds, borderColor: '#10b981', backgroundColor: '#10b98122', tension: 0.3, fill: true, pointRadius: 3 }] }
+        });
 
-        if (initialPlayer) {
-            select.value = initialPlayer;
-            updateDashboard(initialPlayer);
-        }
+        if (fortChart) fortChart.destroy();
+        fortChart = new Chart(document.getElementById('fortChart'), {
+            ...chartOpts('Fort HP', '#ef4444'),
+            data: { labels: times, datasets: [
+                { label: 'Fort HP', data: hps, borderColor: '#ef4444', backgroundColor: '#ef444422', tension: 0.3, fill: true, pointRadius: 3 },
+                { label: 'Max HP',  data: data.map(d => d.hp_max), borderColor: '#475569', borderDash: [4,4], tension: 0.3, fill: false, pointRadius: 0 }
+            ]}
+        });
+    }
 
-        function updateDashboard(playerName) {
-            if (!playerName || !rawData[playerName]) return;
-            localStorage.setItem('dt_selected_player', playerName);
-            const data = rawData[playerName];
-
-            const times = data.map(d => d.timestamp);
-            const golds = data.map(d => d.gold);
-            const hps   = data.map(d => d.hp);
-
-            document.getElementById('current-player-name').textContent = playerName;
-            document.getElementById('total-entries').textContent = data.length;
-            document.getElementById('stat-peak').textContent = Math.max(...golds).toLocaleString();
-
-            if (chart) chart.destroy();
-
-            chart = new Chart(document.getElementById('goldChart'), {
-                type: 'line',
-                data: {
-                    labels: times,
-                    datasets: [
-                        { label: 'Gold',    data: golds, borderColor: '#10b981', yAxisID: 'y',  tension: 0.3, fill: false },
-                        { label: 'Fort HP', data: hps,   borderColor: '#ef4444', borderDash: [5,5], yAxisID: 'y1', tension: 0.3, fill: false }
-                    ]
-                },
-                options: {
-                    scales: {
-                        y:  { type: 'linear', position: 'left',  title: { display: true, text: 'Gold' },    grid: { color: '#334155' } },
-                        y1: { type: 'linear', position: 'right', title: { display: true, text: 'Fort HP' }, grid: { drawOnChartArea: false } }
-                    },
-                    plugins: { legend: { labels: { color: '#f1f5f9' } } }
-                }
-            });
-        }
-
-        // --- AUTO REFRESH aligned to :00 and :30 ---
-        function msUntilNextHalfHour() {
-            const now = new Date();
-            const secondsPast = (now.getMinutes() % 30) * 60 + now.getSeconds();
-            return (30 * 60 - secondsPast) * 1000;
-        }
-
-        function startCountdown(ms) {
-            let remaining = Math.floor(ms / 1000);
-            const el = document.getElementById('countdown');
-            const interval = setInterval(() => {
-                remaining--;
-                const m = String(Math.floor(remaining / 60)).padStart(2, '0');
-                const s = String(remaining % 60).padStart(2, '0');
-                el.textContent = `${m}:${s}`;
-                if (remaining <= 0) {
-                    clearInterval(interval);
-                    el.textContent = 'Refreshing...';
-                    location.reload();
-                }
-            }, 1000);
-        }
-
-        startCountdown(msUntilNextHalfHour());
-    </script>
+    // Auto-refresh aligned to :00 and :30
+    function msUntilNextHalfHour() {
+        const now = new Date();
+        return ((30 * 60) - (now.getMinutes() % 30) * 60 - now.getSeconds()) * 1000;
+    }
+    function startCountdown(ms) {
+        let rem = Math.floor(ms / 1000);
+        const el = document.getElementById('countdown');
+        const iv = setInterval(() => {
+            rem--;
+            const m = String(Math.floor(rem / 60)).padStart(2,'0');
+            const s = String(rem % 60).padStart(2,'0');
+            el.textContent = `${m}:${s}`;
+            if (rem <= 0) { clearInterval(iv); el.textContent = 'Refreshing...'; location.reload(); }
+        }, 1000);
+    }
+    startCountdown(msUntilNextHalfHour());
+</script>
 </body>
 </html>
