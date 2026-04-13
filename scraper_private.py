@@ -3,8 +3,18 @@ import datetime
 import json
 import os
 import re
+import sys
 import time
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+
+def _unhide(path):
+    if sys.platform == "win32" and os.path.isfile(path):
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x80)
+        except Exception:
+            pass
 
 # --- CONFIGURATION ---
 AUTH_FILE = "auth.json"
@@ -38,6 +48,7 @@ _live = {}
 def append_rows(filepath, header, rows):
     """Append rows to a CSV. If the file exists with a different/old header,
     recreate it with the correct header so column mapping never breaks."""
+    _unhide(filepath)
     if os.path.isfile(filepath):
         with open(filepath, "r", encoding="utf-8") as f:
             existing = f.readline().strip()
@@ -738,7 +749,124 @@ def scrape_upgrades(page, ts):
         print(f"     ⚠️ Upgrades failed: {e}")
 
 
-FILE_RANKINGS = "private_rankings.csv"
+FILE_RANKINGS           = "private_rankings.csv"
+FILE_ARMY_LEADERBOARDS  = "private_army_leaderboards.csv"
+
+def scrape_army_leaderboards(page, ts):
+    """Scrape the four army/social detail leaderboards that give us hard data
+    on every ranked player's army size, training volume, population and building
+    investment.  Results are merged into a single player-keyed JSON snapshot
+    (private_army_snapshot.json) consumed by the estimator.
+
+    Leaderboards scraped:
+      army/largest_army       → total current army size  (military count)
+      army/units_trained      → cumulative units ever trained
+      army/highest_population → total population ranking
+      social/building_upgrades→ total building upgrades purchased
+    """
+    LEADERBOARDS = [
+        ("largest_army",      f"{BASE_URL}/leaderboards/army/largest_army?period=alltime&view=detail"),
+        ("units_trained",     f"{BASE_URL}/leaderboards/army/units_trained?period=alltime&view=detail"),
+        ("highest_population",f"{BASE_URL}/leaderboards/army/highest_population?period=alltime&view=detail"),
+        ("building_upgrades", f"{BASE_URL}/leaderboards/social/building_upgrades?period=alltime&view=detail"),
+    ]
+
+    # JS extractor — works for the detail-view leaderboard table format
+    EXTRACT_JS = """() => {
+        const rows = [];
+        // Detail pages use a <table> with tbody rows; each row = one ranked player.
+        const tableRows = document.querySelectorAll('table tbody tr, [class*="leaderboard"] tr');
+        tableRows.forEach(tr => {
+            const cells = Array.from(tr.querySelectorAll('td'));
+            if (cells.length < 2) return;
+
+            // Rank — first cell, usually "#1" or just "1"
+            const rankTxt = (cells[0]?.innerText || '').trim();
+            const rankM   = rankTxt.match(/^#?(\\d+)/);
+            if (!rankM) return;
+            const rank = parseInt(rankM[1]);
+
+            // Player name — prefer <a href*=player>, fall back to 2nd cell text
+            const nameEl = tr.querySelector('a[href*="player"]');
+            let name = (nameEl?.innerText || cells[1]?.innerText || '').trim();
+            name = name.replace(/\\s*\\[.*?\\]/g, '').replace(/\\s+/g,' ').trim();
+            if (!name || name.length < 2) return;
+
+            // Clan badge (optional)
+            const clanEl = tr.querySelector('[class*="clan"],[class*="tag"],.badge');
+            const clan   = (clanEl?.innerText || '').replace(/[\\[\\]]/g,'').trim();
+
+            // Value — last numeric cell (army size, units trained, etc.)
+            let value = 0;
+            for (let i = cells.length - 1; i >= 0; i--) {
+                const n = parseInt((cells[i]?.innerText || '').replace(/[^0-9]/g,''));
+                if (n > 0) { value = n; break; }
+            }
+
+            rows.push({rank, name, clan, value});
+        });
+        return rows;
+    }"""
+
+    print("  🪖 Scraping army / social leaderboards...")
+    all_rows = []   # CSV rows
+    player_map = {} # {name: {army_size, army_rank, units_trained, ...}}
+
+    for key, url in LEADERBOARDS:
+        try:
+            page.goto(url)
+            page.wait_for_load_state("networkidle", timeout=15000)
+            entries = page.evaluate(EXTRACT_JS)
+
+            for e in entries:
+                name = e["name"]
+                rank = e["rank"]
+                val  = e["value"]
+                clan = e["clan"]
+                all_rows.append([ts, key, rank, name, clan, val])
+
+                p = player_map.setdefault(name, {"clan": clan or "—"})
+                if key == "largest_army":
+                    p["army_size"] = val
+                    p["army_rank"] = rank
+                elif key == "units_trained":
+                    p["units_trained"]      = val
+                    p["units_trained_rank"] = rank
+                elif key == "highest_population":
+                    p["population"]      = val
+                    p["population_rank"] = rank
+                elif key == "building_upgrades":
+                    p["building_upgrades"]      = val
+                    p["upgrades_rank"] = rank
+
+            print(f"     ✅ {key}: {len(entries)} players")
+        except Exception as ex:
+            print(f"     ⚠️  {key} failed: {ex}")
+
+    # Derive military fraction for players where both army_size and population known
+    for name, p in player_map.items():
+        army = p.get("army_size", 0)
+        pop  = p.get("population", 0)
+        if army > 0 and pop > 0:
+            p["military_fraction"] = round(army / pop, 4)
+
+    # Write CSV
+    if all_rows:
+        append_rows(FILE_ARMY_LEADERBOARDS,
+            ["Timestamp", "Category", "Rank", "Player", "Clan", "Value"],
+            all_rows)
+
+    # Write JSON snapshot consumed by estimator
+    snap = {"timestamp": ts, "players": player_map}
+    _unhide("private_army_snapshot.json")
+    with open("private_army_snapshot.json", "w", encoding="utf-8") as f:
+        json.dump(snap, f, indent=2)
+    print(f"     📸 Army snapshot → private_army_snapshot.json  "
+          f"({len(player_map)} unique players)")
+
+    # Merge into _live so the estimator can access it in the same run
+    _live["army_data"] = player_map
+
 
 def scrape_rankings(page, ts):
     """
@@ -840,6 +968,7 @@ def scrape_rankings(page, ts):
         _live["rank_map"] = rank_map
 
         # Write a separate JSON snapshot for the estimator to consume
+        _unhide("private_rankings_snapshot.json")
         with open("private_rankings_snapshot.json", "w", encoding="utf-8") as f:
             json.dump({"timestamp": ts, "total_players": total,
                        "rank_map": rank_map, "entries": rankings.get("entries", [])}, f, indent=2)
@@ -858,7 +987,7 @@ def scrape_private():
     print(f"\n🔒 Private scrape at {ts}")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             storage_state=AUTH_FILE if os.path.exists(AUTH_FILE) else None
         )
@@ -883,7 +1012,8 @@ def scrape_private():
         scrape_buildings(page, ts)
         scrape_fort_stats(page, ts)
         scrape_upgrades(page, ts)
-        scrape_rankings(page, ts)          # ← NEW: global leaderboard
+        scrape_army_leaderboards(page, ts)  # army size, units trained, population, upgrades
+        scrape_rankings(page, ts)          # global leaderboard (offense/defense/spy ranks)
         scrape_battle_logs(page, ts)
         scrape_fort_attacks(page, ts)
         scrape_player_profiles(page, ts, force_refresh=True)
@@ -899,7 +1029,8 @@ def scrape_private():
     print("✨ Private scrape complete!")
     print(f"   Files saved: {FILE_SELF_STATS}, {FILE_BANK}, {FILE_UNITS},")
     print(f"                {FILE_ARMORY}, {FILE_BUILDINGS}, {FILE_FORT_STATS}, {FILE_UPGRADES},")
-    print(f"                {FILE_BATTLE_LOGS}, {FILE_FORT_ATTACKS}")
+    print(f"                {FILE_BATTLE_LOGS}, {FILE_FORT_ATTACKS},")
+    print(f"                {FILE_ARMY_LEADERBOARDS}, private_army_snapshot.json")
 
     # Run the economic advisor and estimator after every scrape
     try:
