@@ -1411,9 +1411,23 @@ def run_tick():
         with open("private_latest.json", "w", encoding="utf-8") as _f:
             json.dump(_snapshot, _f, indent=2)
 
-        # ── Scrape rankings (single page) — refreshes all players' ranks ──────
+        # ── Read own server-wide ranks from /stats profile page ──────────────
         try:
             import scraper_private as _scp
+            _own_ranks = _scp.read_own_ranks(page)
+            if any(_own_ranks.values()):
+                _snapshot["rank_overall"] = _own_ranks.get("rank_overall", 0)
+                _snapshot["rank_offense"] = _own_ranks.get("rank_offense", 0)
+                _snapshot["rank_defense"] = _own_ranks.get("rank_defense", 0)
+                _snapshot["rank_wealth"]  = _own_ranks.get("rank_wealth",  0)
+                _unhide("private_latest.json")
+                with open("private_latest.json", "w", encoding="utf-8") as _f:
+                    json.dump(_snapshot, _f, indent=2)
+        except Exception as _e:
+            print(f"  ⚠️ Own ranks read error: {_e}")
+
+        # ── Scrape rankings (single page) — refreshes all players' ranks ──────
+        try:
             _scp.scrape_rankings(page, _ts)
         except Exception as _e:
             print(f"  ⚠️ Rankings scrape error: {_e}")
@@ -1425,13 +1439,21 @@ def run_tick():
         except Exception as _e:
             print(f"  ⚠️ Scraper error: {_e}")
 
-        # ── Run estimator → injects ATK/DEF/SpyOff/SpyDef into dashboard ─────
+        # ── Run estimator (writes fresh private_player_estimates.csv) ───────
         try:
             import estimator as _est
             print("  🔍 Running player estimates...")
             _est.run()
         except Exception as _e:
             print(f"  ⚠️ Estimator error: {_e}")
+
+        # ── Re-run dashboard update so fresh estimates are in the publish ─────
+        # (scraper.scrape_with_page ran BEFORE the estimator wrote the CSV, so
+        #  we call update_dashboard() once more to inject the up-to-date data.)
+        try:
+            _sc.update_dashboard()
+        except Exception as _e:
+            print(f"  ⚠️ Dashboard re-publish error: {_e}")
 
         ctx.storage_state(path=AUTH_FILE)
         browser.close()

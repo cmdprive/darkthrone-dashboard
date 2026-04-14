@@ -1370,12 +1370,11 @@ def run():
             'MineLv': e['mine_lv'], 'Confidence': e['conf'],
         })
 
-    # Save CSV
+    # Save CSV — always overwrite so header never goes stale
     _unhide(OUTPUT)
-    new = not os.path.isfile(OUTPUT)
-    with open(OUTPUT, 'a', newline='', encoding='utf-8') as f:
+    with open(OUTPUT, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=list(results[0].keys()))
-        if new: w.writeheader()
+        w.writeheader()
         w.writerows(results)
     print(f'\n✅ Saved to {OUTPUT}')
 

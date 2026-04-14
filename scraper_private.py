@@ -979,6 +979,53 @@ def scrape_rankings(page, ts):
 
 
 # ---------------------------------------------------------------------------
+# Read own server-wide ranks from /stats (player's own profile page)
+# ---------------------------------------------------------------------------
+
+def read_own_ranks(page) -> dict:
+    """
+    Navigate to /stats (your own profile) and extract your server-wide rank numbers.
+    Returns dict with rank_overall, rank_offense, rank_defense, rank_wealth, rank_spy_off, rank_spy_def.
+    Falls back to all-zeros on error.
+    """
+    result = {"rank_overall": 0, "rank_offense": 0, "rank_defense": 0,
+              "rank_wealth": 0, "rank_spy_off": 0, "rank_spy_def": 0}
+    try:
+        page.goto(f"{BASE_URL}/stats")
+        page.wait_for_load_state("networkidle", timeout=15000)
+
+        RANK_JS = r"""() => {
+            const t = document.body.innerText || '';
+            const n = s => { const m = s?.match(/[\d,]+/); return m ? parseInt(m[0].replace(/,/g,'')) : 0; };
+            const ov_m  = t.match(/Overall\s+#(\d+)/i);
+            const off_m = t.match(/Offense\s+#(\d+)/i);
+            const def_m = t.match(/Defense\s+#(\d+)/i);
+            const nw_m  = t.match(/Net\s*Worth\s+#(\d+)/i);
+            const spo_m = t.match(/Spy\s+(?:Offense|ATK)\s+#(\d+)/i);
+            const spd_m = t.match(/Spy\s+(?:Defense|DEF)\s+#(\d+)/i);
+            return {
+                rank_overall:  ov_m  ? parseInt(ov_m[1])  : 0,
+                rank_offense:  off_m ? parseInt(off_m[1]) : 0,
+                rank_defense:  def_m ? parseInt(def_m[1]) : 0,
+                rank_wealth:   nw_m  ? parseInt(nw_m[1])  : 0,
+                rank_spy_off:  spo_m ? parseInt(spo_m[1]) : 0,
+                rank_spy_def:  spd_m ? parseInt(spd_m[1]) : 0,
+            };
+        }"""
+        ranks = page.evaluate(RANK_JS)
+        result.update({k: v for k, v in ranks.items() if v > 0})
+        if any(result.values()):
+            print(f"  📊 Own ranks: Overall #{result['rank_overall']} | "
+                  f"Offense #{result['rank_offense']} | Defense #{result['rank_defense']} | "
+                  f"Wealth #{result['rank_wealth']}")
+        else:
+            print("  ⚠️  read_own_ranks: no rank text found on /stats page")
+    except Exception as e:
+        print(f"  ⚠️  read_own_ranks failed: {e}")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
