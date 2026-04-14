@@ -1465,10 +1465,11 @@ if __name__ == "__main__":
 # ========================================================================
 
 BASE_ATTACK_URL = "https://darkthronegame.com/game/attack"
+DATA_FILE       = "darkthrone_server_data.csv"
+DASHBOARD_FILE  = "index.html"
 
 # Query parameters that match the target URL exactly
 ATTACK_PARAMS = "sort=level&dir=desc&range=all&bots=all"
-
 
 
 def publish_dashboard():
@@ -3013,10 +3014,12 @@ TICKS        = 48
 ATK_RANK_A = 83_484.0
 ATK_RANK_K = 0.0885
 
-# DEF — Radagon(def_rank=1,DEF=77457) — one confirmed point, same k as ATK
-#   A = 77457/exp(-0.0885*1) ≈ 84,647
+# DEF — seeded from Radagon (April-8 snapshot, likely stale).
+# k is set to 0.015 — a much flatter curve appropriate for a young/compressed server.
+# calibrate_models() will re-anchor A each tick using YOUR real rank+DEF as a data point,
+# so rank_def(your_rank) == your_real_def and everyone above you scores HIGHER.
 DEF_RANK_A = 84_647.0
-DEF_RANK_K = 0.0885
+DEF_RANK_K = 0.015
 
 # SPY OFFENSE — no confirmed spy rank data yet; A=0 means "not yet calibrated"
 # Will be seeded from first confirmed (spy_off_rank, spy_off) pair after profile scrape.
@@ -3076,9 +3079,19 @@ def rank_spy_def(spy_def_rank: int) -> int:
     return int(SPY_DEF_RANK_A * math.exp(-SPY_DEF_RANK_K * spy_def_rank))
 
 
-def calibrate_models(profiles: dict):
-    """Re-calibrate all four stat models using CONFIRMED_STATS cross-referenced
-    with scraped profile ranks. Call once per run after profiles are loaded."""
+def calibrate_models(profiles: dict, you: dict = None):
+    """Re-calibrate all four stat models.
+
+    Data sources (best to least reliable):
+      1. YOUR live stats from private_latest.json  — always fresh, exact rank known
+      2. CONFIRMED_STATS cross-referenced with scraped profile ranks — may be stale
+         (if a confirmed point produces k < 0 the two-point fit is rejected)
+
+    YOUR data is added last so it is always included in the point list and acts as
+    the primary anchor when confirmed data is stale / contradicts server ranks.
+
+    k is capped at 0.05 (max) to prevent absurdly steep rank curves on young servers.
+    """
     global ATK_RANK_A, ATK_RANK_K
     global DEF_RANK_A, DEF_RANK_K
     global SPY_OFF_RANK_A, SPY_OFF_RANK_K
@@ -3086,6 +3099,7 @@ def calibrate_models(profiles: dict):
 
     atk_pts, def_pts, spo_pts, spd_pts = [], [], [], []
 
+    # Collect points from CONFIRMED_STATS (may be stale)
     for cname, cs in CONFIRMED_STATS.items():
         p = profiles.get(cname, {})
         ar  = p.get('off_rank',     0)
@@ -3097,17 +3111,31 @@ def calibrate_models(profiles: dict):
         if sor > 0 and cs.get('spy_off', 0): spo_pts.append((sor, cs['spy_off']))
         if sdr > 0 and cs.get('spy_def', 0): spd_pts.append((sdr, cs['spy_def']))
 
+    # Add YOUR live stats as the most-reliable anchor point
+    # (rank scraped this tick from the server, stat read directly from the game)
+    if you:
+        r_atk = you.get('rank_offense', 0)
+        r_def = you.get('rank_defense', 0)
+        if r_atk > 0 and you.get('atk', 0) > 0:
+            atk_pts.append((r_atk, you['atk']))
+            print(f"     📌 ATK anchor: rank #{r_atk} = {you['atk']:,}  (your live stats)")
+        if r_def > 0 and you.get('def', 0) > 0:
+            def_pts.append((r_def, you['def']))
+            print(f"     📌 DEF anchor: rank #{r_def} = {you['def']:,}  (your live stats)")
+
+    MAX_K = 0.05   # cap: prevents rank-1 estimates from being absurdly large
+
     A, k = _seed_model(atk_pts, ATK_RANK_K, 'ATK model')
-    if A: ATK_RANK_A, ATK_RANK_K = A, k
+    if A: ATK_RANK_A, ATK_RANK_K = A, min(k, MAX_K)
 
     A, k = _seed_model(def_pts, DEF_RANK_K, 'DEF model')
-    if A: DEF_RANK_A, DEF_RANK_K = A, k
+    if A: DEF_RANK_A, DEF_RANK_K = A, min(k, MAX_K)
 
     A, k = _seed_model(spo_pts, ATK_RANK_K, 'SpyOff model')
-    if A: SPY_OFF_RANK_A, SPY_OFF_RANK_K = A, k
+    if A: SPY_OFF_RANK_A, SPY_OFF_RANK_K = A, min(k, MAX_K)
 
     A, k = _seed_model(spd_pts, DEF_RANK_K, 'SpyDef model')
-    if A: SPY_DEF_RANK_A, SPY_DEF_RANK_K = A, k
+    if A: SPY_DEF_RANK_A, SPY_DEF_RANK_K = A, min(k, MAX_K)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def read_csv(path):
@@ -3321,10 +3349,14 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
     rb = RACE.get(race, RACE['Human'])
     cb = CLASS.get(cls,  CLASS['Fighter'])
 
-    # ── CONFIRMED: real stats from profile screenshot ─────────────────────────
+    # ── CONFIRMED: demographic data from profile screenshots ─────────────────
+    # Level/race/cls are stable — use them.  Combat stats (atk/def/spy) may be
+    # weeks old; compare them to the rank-calibrated model and use whichever is
+    # HIGHER (players only get stronger over time, never weaker).
+    # Population ceiling (see below) guards against impossibly large values.
     if clean in CONFIRMED_STATS:
         c = CONFIRMED_STATS[clean]
-        # Override level/race/cls with confirmed values
+        # Stable demographic overrides
         level = c.get('level', level)
         race  = c.get('race',  race)
         cls   = c.get('cls',   cls)
@@ -3334,19 +3366,38 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
         workers = int(pop * 0.80)
         income  = int((BASE_INC + workers * WORKER_GOLD) * mine_mult(mine_lv)
                       * (1 + rb.get('income', 0) + cb.get('income', 0)))
-        ad = kwargs  # army kwargs available in CONFIRMED path too
+        # Rank-calibrated estimates (recalibrated this tick with YOUR live anchor)
+        s_off  = kwargs.get('spy_off_rank', 999)
+        s_def  = kwargs.get('spy_def_rank', 999)
+        cal_atk = rank_atk(off_rank) if off_rank < 900 else 0
+        cal_def = rank_def(def_rank) if def_rank < 900 else 0
+        cal_so  = rank_spy_off(s_off) if s_off < 900 else 0
+        cal_sd  = rank_spy_def(s_def) if s_def < 900 else 0
+        # Use the higher of confirmed (may be stale) vs model (anchored to current server)
+        atk_v = max(c.get('atk',     0), cal_atk)
+        def_v = max(c.get('def',     0), cal_def)
+        spo_v = max(c.get('spy_off', 0), cal_so)
+        spd_v = max(c.get('spy_def', 0), cal_sd)
+        # Population ceiling: a player CANNOT have more stat than their ENTIRE
+        # population fully equipped.  Caps unrealistic model outliers.
+        gt = max_gear_tier(level);  ut = max_unit_tier(level)
+        max_atk_pu = UNIT_OFF[ut] + WEAPON_STATS[gt] + ARMOR_STATS[gt]
+        max_def_pu = UNIT_DEF[ut] + WEAPON_STATS[gt] + ARMOR_STATS[gt]
+        atk_v = min(atk_v, int(pop * max_atk_pu * 1.10))
+        def_v = min(def_v, int(pop * max_def_pu * 1.10))
+        conf  = 'CFM+MODEL' if (cal_atk or cal_def) else 'CONFIRMED'
         return {
             'pop':       pop,     'workers':   workers,
             'off_u':     '?',     'def_u':     '?',
             'spy_u':     '?',     'sent_u':    '?',
-            'atk':       c['atk'], 'def':      c['def'],
-            'spy_off':   c['spy_off'], 'spy_def': c['spy_def'],
+            'atk':       atk_v,   'def':       def_v,
+            'spy_off':   spo_v,   'spy_def':   spd_v,
             'income':    income,  'mine_lv':   mine_lv,
-            'gear_t':    max_gear_tier(level),
+            'gear_t':    gt,
             'unit_t':    FORT_LV_TO_UNIT_TIER[est_fort_lv(level)],
-            'army_size': ad.get('army_size', 0),
-            'upgrades':  max(0, ad.get('building_upgrades', -1)),
-            'conf':      'CONFIRMED',
+            'army_size': kwargs.get('army_size', 0),
+            'upgrades':  max(0, kwargs.get('building_upgrades', -1)),
+            'conf':      conf,
         }
 
     if is_you:
@@ -3458,6 +3509,17 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
     def_    = cal_def     or formula_def
     spy_off = cal_spy_off or formula_spy_off
     spy_def = cal_spy_def or formula_spy_def
+
+    # ── Population ceiling ─────────────────────────────────────────────────────
+    # A player CANNOT have more ATK/DEF than their ENTIRE population, fully
+    # equipped with max-tier gear.  This catches model outliers where an estimated
+    # stat would be impossible given the player's population and level.
+    max_atk_pu  = UNIT_OFF[unit_t] + WEAPON_STATS[gear_t] + ARMOR_STATS[gear_t]
+    max_def_pu  = UNIT_DEF[unit_t] + WEAPON_STATS[gear_t] + ARMOR_STATS[gear_t]
+    pop_ceil_atk = int(pop * max_atk_pu * 1.10)   # 1.10 = best race+class bonus
+    pop_ceil_def = int(pop * max_def_pu * 1.10)
+    atk  = min(atk,  pop_ceil_atk)
+    def_ = min(def_, pop_ceil_def)
 
     # ── Confidence label ───────────────────────────────────────────────────────
     # Priority: army size known > rank-calibrated > formula upper-bound
@@ -3997,9 +4059,11 @@ def estimator_run():
     ts       = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
     results  = []
 
-    # Auto-calibrate DEF model (and verify ATK model) using confirmed players
-    # whose off_rank / def_rank are now known from scraped profiles
-    calibrate_models(profiles)
+    # Calibrate rank→stat models.  YOUR live rank+stats (from private_latest.json)
+    # act as the primary anchor so the model is always consistent with the current
+    # server state.  CONFIRMED_STATS values are used as secondary points but their
+    # combat values may be stale; the model uses whichever is higher.
+    calibrate_models(profiles, you)
 
     # Load rankings snapshot (written by scrape_rankings)
     rank_snap = {}
