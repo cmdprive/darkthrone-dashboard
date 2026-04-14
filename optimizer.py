@@ -234,23 +234,12 @@ def read_state(page):
             if v or key == "citizens":
                 s[key] = v
 
-    # Read your server-wide ranks from page text (same pattern as scraper_private)
+    # Ranks are NOT on the overview page — read_own_ranks() fetches them
+    # from /profile/{id} after save_state() using .rank-item CSS selectors
     s["rank_overall"] = 0
     s["rank_offense"] = 0
     s["rank_defense"] = 0
     s["rank_wealth"]  = 0
-    _m_ov  = re.search(r'Overall\s+#(\d+)',           t, re.I)
-    _m_off = re.search(r'Offense\s+#(\d+)',           t, re.I)
-    _m_def = re.search(r'Defense\s+#(\d+)',           t, re.I)
-    _m_nw  = re.search(r'Net\s*Worth\s+#(\d+)',       t, re.I)
-    if _m_ov:  s["rank_overall"] = int(_m_ov.group(1))
-    if _m_off: s["rank_offense"] = int(_m_off.group(1))
-    if _m_def: s["rank_defense"] = int(_m_def.group(1))
-    if _m_nw:  s["rank_wealth"]  = int(_m_nw.group(1))
-    if any(s[k] for k in ("rank_overall","rank_offense","rank_defense","rank_wealth")):
-        log(f"  📊 Ranks: Overall #{s['rank_overall']} | "
-            f"Offense #{s['rank_offense']} | Defense #{s['rank_defense']} | "
-            f"Wealth #{s['rank_wealth']}")
 
     # Gear owned counts from Arsenal section in overview text
     def gear_count(pat):

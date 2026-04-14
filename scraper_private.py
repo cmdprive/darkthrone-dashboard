@@ -982,35 +982,58 @@ def scrape_rankings(page, ts):
 # Read own server-wide ranks from /stats (player's own profile page)
 # ---------------------------------------------------------------------------
 
+def _get_own_player_id() -> int:
+    """Read own player ID from private_player_profiles.csv (most recent row for own name)."""
+    if not os.path.isfile(FILE_PROFILES):
+        return 0
+    try:
+        rows = read_csv(FILE_PROFILES)
+        # Own name should contain 'beginner' (case-insensitive) — adjust if needed
+        own_rows = [r for r in rows if 'beginner' in r.get('Player', '').lower()]
+        if own_rows:
+            return int(own_rows[-1].get('PlayerID', 0))
+    except Exception:
+        pass
+    return 0
+
+
 def read_own_ranks(page) -> dict:
     """
-    Navigate to /stats (your own profile) and extract your server-wide rank numbers.
-    Returns dict with rank_overall, rank_offense, rank_defense, rank_wealth, rank_spy_off, rank_spy_def.
+    Navigate to own public profile page (/profile/{id}) and extract server-wide ranks
+    using CSS selectors .rank-label / .rank-value (same structure as other player profiles).
     Falls back to all-zeros on error.
     """
     result = {"rank_overall": 0, "rank_offense": 0, "rank_defense": 0,
               "rank_wealth": 0, "rank_spy_off": 0, "rank_spy_def": 0}
     try:
-        page.goto(f"{BASE_URL}/stats")
+        pid = _get_own_player_id()
+        if not pid:
+            print("  ⚠️  read_own_ranks: player ID not found in profiles CSV")
+            return result
+
+        page.goto(f"{BASE_URL}/profile/{pid}")
         page.wait_for_load_state("networkidle", timeout=15000)
 
+        # Profile page uses .rank-item > .rank-label + .rank-value structure
         RANK_JS = r"""() => {
-            const t = document.body.innerText || '';
-            const n = s => { const m = s?.match(/[\d,]+/); return m ? parseInt(m[0].replace(/,/g,'')) : 0; };
-            const ov_m  = t.match(/Overall\s+#(\d+)/i);
-            const off_m = t.match(/Offense\s+#(\d+)/i);
-            const def_m = t.match(/Defense\s+#(\d+)/i);
-            const nw_m  = t.match(/Net\s*Worth\s+#(\d+)/i);
-            const spo_m = t.match(/Spy\s+(?:Offense|ATK)\s+#(\d+)/i);
-            const spd_m = t.match(/Spy\s+(?:Defense|DEF)\s+#(\d+)/i);
-            return {
-                rank_overall:  ov_m  ? parseInt(ov_m[1])  : 0,
-                rank_offense:  off_m ? parseInt(off_m[1]) : 0,
-                rank_defense:  def_m ? parseInt(def_m[1]) : 0,
-                rank_wealth:   nw_m  ? parseInt(nw_m[1])  : 0,
-                rank_spy_off:  spo_m ? parseInt(spo_m[1]) : 0,
-                rank_spy_def:  spd_m ? parseInt(spd_m[1]) : 0,
-            };
+            const out = {rank_overall:0, rank_offense:0, rank_defense:0,
+                         rank_wealth:0, rank_spy_off:0, rank_spy_def:0};
+            document.querySelectorAll('.rank-item').forEach(item => {
+                const labelEl = item.querySelector('.rank-label');
+                const valueEl = item.querySelector('.rank-value');
+                if (!labelEl || !valueEl) return;
+                const label = labelEl.innerText.trim().toLowerCase();
+                const m = valueEl.innerText.match(/#(\d+)/);
+                if (!m) return;
+                const v = parseInt(m[1]);
+                if (label.includes('overall'))                     out.rank_overall = v;
+                else if (label.includes('offense'))                out.rank_offense = v;
+                else if (label.includes('defense'))                out.rank_defense = v;
+                else if (label.includes('net') || label.includes('wealth')) out.rank_wealth = v;
+                else if (label.includes('spy') && label.includes('off'))    out.rank_spy_off = v;
+                else if (label.includes('spy') && label.includes('def'))    out.rank_spy_def = v;
+            });
+            return out;
         }"""
         ranks = page.evaluate(RANK_JS)
         result.update({k: v for k, v in ranks.items() if v > 0})
@@ -1019,7 +1042,7 @@ def read_own_ranks(page) -> dict:
                   f"Offense #{result['rank_offense']} | Defense #{result['rank_defense']} | "
                   f"Wealth #{result['rank_wealth']}")
         else:
-            print("  ⚠️  read_own_ranks: no rank text found on /stats page")
+            print(f"  ⚠️  read_own_ranks: no .rank-item elements found on /profile/{pid}")
     except Exception as e:
         print(f"  ⚠️  read_own_ranks failed: {e}")
     return result
