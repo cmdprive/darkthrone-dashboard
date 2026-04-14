@@ -870,112 +870,96 @@ def scrape_army_leaderboards(page, ts):
 
 def scrape_rankings(page, ts):
     """
-    Scrapes the Global Rankings page — all tabs (Global, Combat, Spy, Economy, Army).
-    Captures rank, player name, clan, value for each leaderboard.
-    This gives us offense rank, defense rank, level rank, etc. for every tracked player.
+    Scrape global leaderboards directly from the detail pages:
+      /leaderboards/global/overall   → overall rank for every player
+      /leaderboards/global/offense   → offense (ATK) rank
+      /leaderboards/global/defense   → defense (DEF) rank
+
+    Paginates through all pages (~50 rows each) until empty.
+    Saves rank_map to private_rankings_snapshot.json for the estimator.
     """
     print("  🏆 Scraping global rankings...")
-    try:
-        page.goto(f"{BASE_URL}/rankings")
-        page.wait_for_load_state("networkidle", timeout=15000)
 
-        rankings = page.evaluate("""() => {
-            const results = [];
+    # JS that extracts all .ranking-row entries from the current page
+    EXTRACT_JS = r"""() => {
+        const rows = [];
+        document.querySelectorAll('.ranking-row').forEach(row => {
+            const posEl  = row.querySelector('.ranking-position');
+            const nameEl = row.querySelector('.player-name');
+            if (!posEl || !nameEl) return;
+            const rankM = posEl.innerText.match(/#?(\d+)/);
+            if (!rankM) return;
+            const rank = parseInt(rankM[1]);
+            // Extract name from direct text nodes only — ignores Friend/Clan badges
+            const name = Array.from(nameEl.childNodes)
+                .filter(n => n.nodeType === 3)
+                .map(n => n.textContent.trim())
+                .filter(Boolean)
+                .join(' ')
+                .trim();
+            const href   = nameEl.getAttribute('href') || '';
+            const idM    = href.match(/\/player\/(\d+)/);
+            const pid    = idM ? parseInt(idM[1]) : 0;
+            const clanEl = row.querySelector('.player-clan');
+            const clan   = (clanEl?.innerText || '').replace(/[\[\]]/g,'').trim();
+            if (name && rank) rows.push({rank, name, pid, clan});
+        });
+        return rows;
+    }"""
 
-            // Each leaderboard widget on the page
-            document.querySelectorAll('.leaderboard-widget, .rankings-widget, [class*="leaderboard"], [class*="ranking"]').forEach(widget => {
-                // Widget title (e.g. "OVERALL POWER", "OFFENSE", "DEFENSE", "LEVEL")
-                const title = (widget.querySelector('h2,h3,[class*="title"],[class*="header"]')
-                               ?.innerText || '').trim().toUpperCase();
-                if (!title) return;
+    rank_map   = {}   # {player_name: {overall, off_rank, def_rank, clan, player_id}}
+    csv_rows   = []
+    total_p    = 0
 
-                widget.querySelectorAll('tr, [class*="row"], li').forEach(row => {
-                    const text = row.innerText || '';
-                    // Look for rank number like "#1" or "1."
-                    const rankM = text.match(/^#?(\\d+)/);
-                    if (!rankM) return;
-                    const rank = parseInt(rankM[1]);
+    CATS = [
+        ("overall", "overall"),
+        ("offense", "off_rank"),
+        ("defense", "def_rank"),
+    ]
 
-                    // Player name — strip clan badges
-                    const nameEl = row.querySelector('a, [class*="player"], [class*="name"]');
-                    let name = (nameEl?.innerText || '').trim();
-                    // Remove clan tag like "[RQUM]"
-                    name = name.replace(/\\s*\\[.*?\\]/g, '').trim();
-                    if (!name) return;
+    for cat_slug, field in CATS:
+        base = f"{BASE_URL}/leaderboards/global/{cat_slug}?period=alltime&view=detail"
+        page_num = 1
+        while True:
+            url = base if page_num == 1 else f"{base}&page={page_num}"
+            try:
+                page.goto(url)
+                page.wait_for_load_state("networkidle", timeout=15000)
+                entries = page.evaluate(EXTRACT_JS)
+            except Exception as _e:
+                print(f"     ⚠️  {cat_slug} page {page_num} failed: {_e}")
+                break
+            if not entries:
+                break
+            for e in entries:
+                n = e["name"]
+                if not n:
+                    continue
+                if n not in rank_map:
+                    rank_map[n] = {"clan": e["clan"] or "—",
+                                   "player_id": e["pid"]}
+                rank_map[n][field] = e["rank"]
+                if cat_slug == "overall":
+                    total_p = max(total_p, e["rank"])
+                csv_rows.append([ts, cat_slug, e["rank"], n, e["clan"], e["pid"]])
+            page_num += 1
 
-                    // Clan tag
-                    const clanEl = row.querySelector('[class*="clan"], .badge');
-                    const clan = (clanEl?.innerText || '').replace(/[\\[\\]]/g,'').trim();
-
-                    // Value (shown for level ranking)
-                    const cells = row.querySelectorAll('td');
-                    const value = cells.length > 0
-                        ? parseInt((cells[cells.length-1]?.innerText||'').replace(/[^0-9]/g,'')) || 0
-                        : 0;
-
-                    results.push({category: title, rank, name, clan, value});
-                });
-            });
-
-            // Fallback: scrape "Your rank: #X / Y" lines to get total player count
-            const bodyText = document.body.innerText || '';
-            const totalM = bodyText.match(/Your rank:\\s*#\\d+\\s*\\/\\s*(\\d+)/);
-            const total = totalM ? parseInt(totalM[1]) : 0;
-
-            return {entries: results, total_players: total};
-        }""")
-
-        rows = []
-        for e in rankings.get("entries", []):
-            rows.append([ts, e["category"], e["rank"], e["name"], e["clan"], e["value"]])
-
-        total = rankings.get("total_players", 0)
-
+    if csv_rows:
         append_rows(FILE_RANKINGS,
-            ["Timestamp", "Category", "Rank", "Player", "Clan", "Value"],
-            rows
-        )
+                    ["Timestamp", "Category", "Rank", "Player", "Clan", "PlayerID"],
+                    csv_rows)
 
-        # Also update _live with rankings info
-        _live["total_players"] = total
-        cats = {}
-        for e in rankings.get("entries", []):
-            cats.setdefault(e["category"], []).append(e)
-        print(f"     ✅ {len(rows)} ranking entries across {len(cats)} categories | "
-              f"Total players: {total}")
+    _live["rank_map"]      = rank_map
+    _live["total_players"] = total_p
 
-        # Build a flat dict of {player: {overall, offense, defense, level, clan}} for estimator
-        rank_map = {}
-        for e in rankings.get("entries", []):
-            n = e["name"]
-            if n not in rank_map:
-                rank_map[n] = {"clan": e["clan"] or "—"}
-            cat = e["category"]
-            if "OVERALL" in cat:
-                rank_map[n]["overall"]      = e["rank"]
-            elif "SPY" in cat and ("OFF" in cat or "ATK" in cat):
-                rank_map[n]["spy_off_rank"] = e["rank"]
-            elif "SPY" in cat and ("DEF" in cat or "DEFENSE" in cat):
-                rank_map[n]["spy_def_rank"] = e["rank"]
-            elif "OFFENSE" in cat or "ATTACK" in cat:
-                rank_map[n]["off_rank"]     = e["rank"]
-            elif "DEFENSE" in cat:
-                rank_map[n]["def_rank"]     = e["rank"]
-            elif "LEVEL" in cat:
-                rank_map[n]["lv_rank"]      = e["rank"]
-                rank_map[n]["level"]        = e["value"]
+    _unhide("private_rankings_snapshot.json")
+    with open("private_rankings_snapshot.json", "w", encoding="utf-8") as f:
+        json.dump({"timestamp": ts, "total_players": total_p,
+                   "rank_map": rank_map}, f, indent=2)
 
-        _live["rank_map"] = rank_map
-
-        # Write a separate JSON snapshot for the estimator to consume
-        _unhide("private_rankings_snapshot.json")
-        with open("private_rankings_snapshot.json", "w", encoding="utf-8") as f:
-            json.dump({"timestamp": ts, "total_players": total,
-                       "rank_map": rank_map, "entries": rankings.get("entries", [])}, f, indent=2)
-        print(f"     📸 Rankings snapshot → private_rankings_snapshot.json")
-
-    except Exception as e:
-        print(f"     ⚠️ Rankings failed: {e}")
+    n_players = len(rank_map)
+    print(f"     ✅ {n_players} players ranked | Total: {total_p} | "
+          f"{len(csv_rows)} rows written")
 
 
 # ---------------------------------------------------------------------------
@@ -1011,7 +995,7 @@ def read_own_ranks(page) -> dict:
             print("  ⚠️  read_own_ranks: player ID not found in profiles CSV")
             return result
 
-        page.goto(f"{BASE_URL}/profile/{pid}")
+        page.goto(f"{BASE_URL}/player/{pid}")
         page.wait_for_load_state("networkidle", timeout=15000)
 
         # Profile page uses .rank-item > .rank-label + .rank-value structure
@@ -1042,7 +1026,7 @@ def read_own_ranks(page) -> dict:
                   f"Offense #{result['rank_offense']} | Defense #{result['rank_defense']} | "
                   f"Wealth #{result['rank_wealth']}")
         else:
-            print(f"  ⚠️  read_own_ranks: no .rank-item elements found on /profile/{pid}")
+            print(f"  ⚠️  read_own_ranks: no .rank-item elements found on /player/{pid}")
     except Exception as e:
         print(f"  ⚠️  read_own_ranks failed: {e}")
     return result
