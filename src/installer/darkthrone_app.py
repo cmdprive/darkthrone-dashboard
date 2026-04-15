@@ -13,14 +13,60 @@ First time:
 Requirements:  pip install playwright && playwright install chromium
 """
 
-# ── Path fix: works when run as .py (subfolder), frozen .exe, or from root ────
-import os as _os, sys as _sys
+# ── Path fix ────────────────────────────────────────────────────────────────
+# Post-reorg layout:
+#   <darkthrone>/
+#     ├── data/                         runtime data (cwd lives here)
+#     ├── src/
+#     │   ├── optimizer.py
+#     │   ├── index.html                dashboard template
+#     │   └── installer/darkthrone_app.py
+#     └── release/DarkThrone Suite/
+#         └── DarkThrone Suite.exe      frozen entry point
+#
+# Both the frozen exe and the source .py are 3 dirnames away from the
+# darkthrone root, so the path math is symmetric:
+#   .py:   src/installer/darkthrone_app.py  → installer → src → darkthrone
+#   .exe:  release/DarkThrone Suite/DT Suite.exe → Suite dir → release → darkthrone
+#
+# We chdir into darkthrone/data/ so every bare filename reference inside
+# optimizer.py ("private_latest.json", "auth.json", etc.) resolves there.
+# The dashboard TEMPLATE lives at src/index.html and is copied into data/
+# on first run; after that update_dashboard() rewrites data/index.html in
+# place.  optimizer.py has no hardcoded absolute paths, so moving source
+# doesn't require any edits inside optimizer.py itself.
+import os as _os, sys as _sys, shutil as _shutil
 if getattr(_sys, "frozen", False):
-    _ROOT = _os.path.dirname(_sys.executable)
+    _exe_dir    = _os.path.dirname(_sys.executable)              # release/DarkThrone Suite/
+    _darkthrone = _os.path.dirname(_os.path.dirname(_exe_dir))   # darkthrone/
+    _src_dir    = _os.path.join(_darkthrone, "src")
 else:
-    _ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-_os.chdir(_ROOT)
-_sys.path.insert(0, _ROOT)
+    _here       = _os.path.dirname(_os.path.abspath(__file__))   # src/installer/
+    _src_dir    = _os.path.dirname(_here)                        # src/
+    _darkthrone = _os.path.dirname(_src_dir)                     # darkthrone/
+    _exe_dir    = ""
+
+_DATA_DIR = _os.path.join(_darkthrone, "data")
+_os.makedirs(_DATA_DIR, exist_ok=True)
+_os.chdir(_DATA_DIR)
+
+# Bootstrap dashboard template: if data/index.html doesn't exist yet, seed
+# it from the template shipped alongside the source (or bundled with the exe).
+_dashboard_out = _os.path.join(_DATA_DIR, "index.html")
+if not _os.path.isfile(_dashboard_out):
+    for _tpl in (_os.path.join(_src_dir, "index.html"),
+                 _os.path.join(_exe_dir, "index.html") if _exe_dir else ""):
+        if _tpl and _os.path.isfile(_tpl):
+            try:    _shutil.copy2(_tpl, _dashboard_out)
+            except Exception: pass
+            break
+
+# So `import optimizer` finds the source module when running as .py.
+# (The frozen exe has optimizer.pyc bundled in _internal/; this insert is a
+# no-op there but harmless.)
+if _src_dir not in _sys.path:
+    _sys.path.insert(0, _src_dir)
+_ROOT = _DATA_DIR   # backward-compat alias for anything downstream
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Playwright browser cache redirect (frozen bundle only) ───────────────────

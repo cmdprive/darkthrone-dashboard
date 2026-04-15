@@ -1,0 +1,34 @@
+# ── Private runtime data ─────────────────────────────────────────────────────
+# Everything under data/ is per-user state: auth cookies, live stats,
+# estimator output, battle audit trail, intel harvested from real attacks.
+# None of it belongs in version control.
+data/
+private_*
+auth.json
+user_config.json
+darkthrone_server_data.csv
+optimizer_chart.html
+
+# ── Build artifacts ──────────────────────────────────────────────────────────
+# PyInstaller writes to src/dist and src/build when build.bat runs.
+# The final release/ folder is shipped but not tracked.
+src/dist/
+src/build/
+src/**/*.pyc
+src/**/__pycache__/
+*.spec
+release/
+
+# ── Debug / dev dumps ────────────────────────────────────────────────────────
+dump_*.html
+debug_*.html
+debug_*.txt
+*.bak
+page_*.html
+
+# ── Runtime locks ────────────────────────────────────────────────────────────
+.battle.lock
+.optimizer.lock
+
+# ── Claude Code session state ────────────────────────────────────────────────
+.claude/
