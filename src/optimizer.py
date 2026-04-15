@@ -900,6 +900,28 @@ def _unit_base_stat(unit, player_lv):
 
 
 # ── Option generators ─────────────────────────────────────────────────────────
+def _max_building_lv_at_player_lv(bname, player_lv):
+    """Return the highest building level the player is CURRENTLY allowed to
+    own given their player level.  Uses the existing est_*_lv() gating
+    functions (which encode confirmed in-game player-level requirements:
+    Mine Lv2 needs Lv12, Fort Lv2 needs Lv20, Armory Lv2 needs Lv30, etc.).
+
+    For buildings without a dedicated gate function (Housing, Barracks,
+    Mercenary Camp), falls back to the max_lv from BUILDINGS — in practice
+    these buildings have their initial req_lv in BUILDINGS but no confirmed
+    per-level gates, so we allow the full range once req_lv is met."""
+    if bname == "Mine":          return est_mine_lv(player_lv)
+    if bname == "Armory":        return est_armory_lv(player_lv)
+    if bname == "Fortification": return est_fort_lv(player_lv)
+    if bname == "Spy Academy":   return est_spy_ac_lv(player_lv)
+    # Housing / Barracks / Mercenary Camp: no per-level gate known.
+    # Return max_lv from BUILDINGS so the only gate is req_lv + prereqs.
+    for _bn, _rl, _bc, _ml, _bt in BUILDINGS:
+        if _bn == bname:
+            return _ml
+    return 0
+
+
 def _gen_build_options(state):
     """One option per eligible building-level upgrade."""
     out = []
@@ -911,9 +933,21 @@ def _gen_build_options(state):
 
     for bname, req_lv, base_cost, max_lv, btype in BUILDINGS:
         cur_lv = builds.get(bname, 0)
-        if cur_lv >= max_lv or level < req_lv:
+        # Absolute ceiling from the BUILDINGS table (e.g., Mine maxes at Lv5).
+        if cur_lv >= max_lv:
             continue
-        # Prereq check (e.g., Mine Lv2 needs Fortification Lv1)
+        # Initial-build player-level gate (e.g., Mine needs player Lv3 before
+        # you can build Lv1 at all).
+        if level < req_lv:
+            continue
+        # PER-LEVEL player-level gate: Armory Lv2 needs player Lv30, Fort Lv2
+        # needs Lv20, Mine Lv2 needs Lv12, etc.  Without this check we'd
+        # propose upgrades the server rejects with a disabled-button error,
+        # wasting a slot in the 12-action budget.
+        reachable = _max_building_lv_at_player_lv(bname, level)
+        if (cur_lv + 1) > reachable:
+            continue
+        # Dependency prereq (e.g., Mine Lv2 needs Fortification Lv1 already built)
         prereq = BUILDING_PREREQ.get((bname, cur_lv + 1), {})
         if any(builds.get(b, 0) < req for b, req in prereq.items()):
             continue
