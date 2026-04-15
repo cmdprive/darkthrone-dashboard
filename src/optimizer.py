@@ -1909,6 +1909,14 @@ BATTLE_DAILY_MAX = 5
 SPY_GOLD_COST  = 3000
 SPY_TURNS_COST = 2
 
+# Per-target spy cooldown: don't re-spy the same player within this many
+# hours.  Intel from a successful recon is good for at least this long —
+# stats don't move fast enough for re-spying to reveal new info, and we
+# save gold + turns for new targets instead.  Enforced via the persistent
+# private_intel.csv (load_spy_cooldowns) so the cooldown survives across
+# Suite restarts.
+SPY_COOLDOWN_HOURS = 6
+
 
 class BattleStop(Exception):
     """Raised to unwind battle_loop cleanly with a reason string.
@@ -2277,13 +2285,18 @@ def read_reset_countdown(page) -> int:
 
 # ── Target picker (pure function — unit-testable) ───────────────────────────
 def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
-                         cfg: dict, mode: str = "attack") -> list:
+                         cfg: dict, mode: str = "attack",
+                         spy_cooldown=None) -> list:
     """Filter + sort battle candidates.
-    rows: list from scrape_attack_candidates()
-    estimates: {PlayerID: {est_def, est_spy_def, ...}} from load_estimates_lookup()
+    rows: list from scrape_attack_candidates() / scrape_spy_candidates()
+    estimates: {Player name: {est_def, est_spy_def, ...}} from load_estimates_lookup()
     our_stats: {'atk', 'spy_off', 'gold', 'turns', ...}
     cfg: {margin, skip_friends, skip_clan, skip_bots, max_per_pass, ...}
     mode: 'attack' or 'spy'
+    spy_cooldown: optional set of player names we've successfully spied
+        within the last SPY_COOLDOWN_HOURS — filtered out in spy mode
+        regardless of the daily (N/5) counter.
+
     Returns filtered+sorted list (same dict shape as rows, with extras)."""
     margin = float(cfg.get("margin", 1.2)) or 1.2
     if margin < 1.0:
@@ -2297,6 +2310,8 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
     our_spy_off = int(our_stats.get("spy_off", 0))
     our_gold    = int(our_stats.get("gold",    0))
     our_turns   = int(our_stats.get("turns",   0))
+
+    cooldown_set = set(spy_cooldown) if spy_cooldown else set()
 
     safe = []
     for r in rows:
@@ -2312,7 +2327,8 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
             continue
 
         # estimates CSV keys by player NAME (no PlayerID column), so join there.
-        est = estimates.get(str(r.get("name", "")).replace(" (YOU)", "").strip(), {})
+        name_clean = str(r.get("name", "")).replace(" (YOU)", "").strip()
+        est = estimates.get(name_clean, {})
         if mode == "attack":
             est_def = int(est.get("est_def", 0))
             if est_def <= 0:
@@ -2323,6 +2339,10 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
             r["atk_ratio"] = our_atk / max(est_def, 1)
             safe.append(r)
         elif mode == "spy":
+            # Persistent cooldown: if we successfully spied this name within
+            # the last SPY_COOLDOWN_HOURS, skip.  Cross-session.
+            if name_clean in cooldown_set:
+                continue
             if our_gold  < SPY_GOLD_COST:  continue
             if our_turns < SPY_TURNS_COST: continue
             est_sd = int(est.get("est_spy_def", 0))
@@ -2750,6 +2770,50 @@ def record_intel(entry: dict, log_fn=None) -> None:
         log_fn(f"  🛰  intel({src}) {name}: {detail}", "dim")
 
 
+def load_spy_cooldowns() -> dict:
+    """Return {player_name: datetime} of the most recent SUCCESSFUL recon
+    spy report for each target in private_intel.csv.
+
+    A row counts as 'successful' when the Level column is populated — that
+    means parse_spy_report actually extracted the target's profile block.
+    Empty / failed rows (e.g. old entries from before the parser fix, or
+    `skipped_form_not_found`) have no Level and are ignored.
+
+    Used by battle_loop to enforce the SPY_COOLDOWN_HOURS no-re-spy window
+    ACROSS Suite sessions — the cooldown is stored on disk, not in RAM,
+    so closing + relaunching the Suite doesn't reset it.
+    """
+    path = INTEL_FILE
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if (row.get("Source") or "").strip() != "spy":
+                    continue
+                name  = (row.get("Player")    or "").strip()
+                level = (row.get("Level")     or "").strip()
+                ts    = (row.get("Timestamp") or "").strip()
+                if not name or not level or not ts:
+                    continue   # skipped / failed / legacy row
+                dt = None
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                    try:
+                        dt = datetime.datetime.strptime(ts, fmt)
+                        break
+                    except ValueError:
+                        pass
+                if dt is None:
+                    continue
+                # Keep the LATEST timestamp per player
+                if name not in out or dt > out[name]:
+                    out[name] = dt
+    except Exception as e:
+        print(f"  ⚠️  load_spy_cooldowns failed: {e}")
+    return out
+
+
 def load_intel_overlay() -> dict:
     """Read private_intel.csv and return {Player name: latest_stats}.
     Latest row per player wins (by timestamp order in the file — append-only)."""
@@ -2984,6 +3048,28 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
     # re-scrape loop bounces forever on stale candidates.
     session_exhausted = set()
 
+    # Spy cooldown (names only; intel CSV has no player_id column).
+    # Loaded ONCE at session start from private_intel.csv (persistent) and
+    # then grown during the session as we successfully spy new targets, so
+    # we don't re-spy anyone within SPY_COOLDOWN_HOURS.
+    spy_cooldown = set()
+    if mode == "spy":
+        try:
+            _now    = datetime.datetime.now()
+            _cutoff = _now - datetime.timedelta(hours=SPY_COOLDOWN_HOURS)
+            _cds    = load_spy_cooldowns()
+            spy_cooldown = {n for n, dt in _cds.items() if dt > _cutoff}
+            # Show the 3 most-recent + total count so the user can see
+            # which targets are on cooldown without scrolling the CSV.
+            recent = sorted(_cds.items(), key=lambda x: x[1], reverse=True)[:3]
+            hint = ", ".join(f"{n} ({int((_now-dt).total_seconds()//60)}m ago)"
+                             for n, dt in recent if n in spy_cooldown)
+            log_fn(f"  ⏱  spy cooldown: {len(spy_cooldown)} on cooldown "
+                   f"(≤{SPY_COOLDOWN_HOURS}h rule)" +
+                   (f"  — recent: {hint}" if hint else ""), "dim")
+        except Exception as e:
+            log_fn(f"  ⚠️  spy cooldown load failed: {e}", "dim")
+
     # Seed our_stats from private_latest.json so we know our ATK / SpyOff.
     # The GUI doesn't pass our_stats in cfg; without this seed, atk/spy_off
     # default to 0 and every target fails the margin filter — the loop
@@ -3048,7 +3134,10 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
                     # Remove anything already permanently exhausted this session.
                     rows = [r for r in rows if str(r.get("player_id")) not in session_exhausted]
                     estimates = load_estimates_lookup()
-                    targets = pick_battle_targets(rows, estimates, our_stats, cfg, mode=mode)
+                    targets = pick_battle_targets(
+                        rows, estimates, our_stats, cfg, mode=mode,
+                        spy_cooldown=(spy_cooldown if mode == "spy" else None),
+                    )
                     if not targets:
                         log_fn("  ℹ️  No safe targets left this pass.", "dim")
                         raise BattleStop("no_targets", "filter + daily caps exhausted pool")
@@ -3107,6 +3196,13 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
                         actions += 1
                         if r == "win" or r == "spy_ok":
                             wins += 1
+                            # In spy mode, mark the target as cooling down
+                            # for the remainder of this session so the next
+                            # pass doesn't re-pick them.  The persistent
+                            # copy is already in private_intel.csv via
+                            # record_intel called inside do_spy.
+                            if mode == "spy":
+                                spy_cooldown.add(str(tgt.get("name", "")).replace(" (YOU)", "").strip())
                         elif r == "loss" or r == "spy_fail":
                             losses += 1
 
