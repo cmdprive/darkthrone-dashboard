@@ -2931,19 +2931,25 @@ def do_attack(page, target: dict, turns: int, log_fn, dry_run: bool = False) -> 
 
 def do_spy(page, target: dict, log_fn, dry_run: bool = False) -> dict:
     """Recon spy the target.  Returns the parse_battle_result dict."""
-    pid  = str(target["player_id"])
-    name = target["name"]
+    pid       = str(target["player_id"])
+    name      = target["name"]
+    list_page = int(target.get("list_page", 1)) or 1
     gold_before = read_live_header(page).get("gold", 0)
 
     if dry_run:
         log_fn(f"  [DRY] 🔍 would spy {name} (pid={pid})  (ratio {target.get('spy_ratio',0):.2f}×)", "dim")
         return {"result": "dry_run", "xp": 0, "gold_gained": 0}
 
-    # Navigate to the spy/intelligence page first — the spy forms live there.
-    # The game's actual URL is /game/spy (the old /game/intelligence was a
-    # stale guess that returns 404 now).
+    # Navigate to the EXACT /game/spy page the target was scraped from.
+    # The spy page paginates (~19 players per page); each row's inline
+    # <form action="/game/spy/{pid}"> only exists on the page where the
+    # target is listed, so navigating blindly to page 1 would find zero
+    # forms for any target from pages 2+ and every submit would fail
+    # with form_not_found.  scrape_spy_candidates records list_page on
+    # every row for exactly this purpose (same pattern as do_attack).
+    spy_url = f"{BASE_URL}/spy" + (f"?page={list_page}" if list_page > 1 else "")
     try:
-        page.goto(f"{BASE_URL}/spy")
+        page.goto(spy_url)
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
