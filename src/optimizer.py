@@ -779,6 +779,479 @@ def decide(s, cats, strategy=None):
 
     return actions, gold_left
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARGINAL-VALUE DECISION ENGINE  (decide_v2)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Replaces the hardcoded 7-stage priority pipeline with a generate-score-greedy
+# loop that compares every possible spend (build, buy gear, upgrade gear, train,
+# battle upgrade) on a single "net-worth per gold" axis.  Strategies bias the
+# objective function instead of rearranging stages, so tuning is one dict of
+# weights instead of a pile of branches.
+#
+# Key contract: every option dict emitted by a generator has the same shape as
+# the action dicts the existing execute() / _build() / _buy_gear() / _train() /
+# _buy_upgrade() / _repair_fort() / _bank() functions already consume.  No
+# changes to execute() are required — decide_v2 output is drop-in compatible.
+#
+# Flip USE_DECIDE_V2 to False to revert to the legacy decide() engine (kept
+# in-file as a safety net for one release cycle).
+
+USE_DECIDE_V2 = True
+
+# How many ticks into the future we assume a spend will pay back over.
+# BOTH income and stat gains persist — income compounds per tick, and a
+# gear/tier upgrade stays installed on every future tick too.  So we treat
+# all persistent benefits with the same horizon multiplier.  200 ticks ≈
+# 100 hours at 30-min cadence ≈ one game-day of useful lifetime.
+HORIZON_TICKS = 200
+
+# Strategy weights for the scoring function.  All weights are in "gold
+# equivalent per unit of benefit per tick".  Income is naturally gold/tick,
+# so w_income=1.0 is the identity.  Stats are valued via a rough "gold per
+# stat point per tick" conversion — 1 ATK point earning roughly 0.2g per
+# tick of auto-farming is the Grow calibration point.  Weights then
+# rescale that for Combat (ATK-heavy) and Defend (DEF-heavy) profiles.
+#
+# Keys must match STRATEGY_LABELS in src/installer/darkthrone_app.py.
+# Legacy names are remapped via _normalize_strategy_key() below.
+STRATEGY_WEIGHTS = {
+    # Grow: net-worth focus.  Income dominates, stats are secondary.
+    # A Mine/Housing upgrade always beats a gear upgrade in Grow.
+    "grow":   {"w_income": 1.0, "w_atk": 0.2, "w_def": 0.1, "w_xp": 1.0},
+
+    # Combat: ATK-heavy.  Income halved, ATK x5 vs Grow.
+    "combat": {"w_income": 0.4, "w_atk": 1.0, "w_def": 0.2, "w_xp": 0.5},
+
+    # Defend: DEF-heavy.  Same shape but DEF x10 vs Grow.
+    "defend": {"w_income": 0.4, "w_atk": 0.1, "w_def": 1.0, "w_xp": 0.5},
+}
+DEFAULT_STRATEGY_V2 = "grow"
+
+_LEGACY_STRAT_MAP = {
+    "balanced": "grow",
+    "economy":  "grow",
+    "attack":   "combat",
+    "spy":      "combat",
+    "defense":  "defend",
+    "hybrid":   "defend",
+}
+
+def _normalize_strategy_key(key):
+    """Return a valid decide_v2 strategy key, mapping legacy names if needed."""
+    if not key:
+        return DEFAULT_STRATEGY_V2
+    key = str(key).strip().lower()
+    if key in STRATEGY_WEIGHTS:
+        return key
+    return _LEGACY_STRAT_MAP.get(key, DEFAULT_STRATEGY_V2)
+
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
+def score_option(opt, w):
+    """Return net-worth-equivalent-per-gold for an option dict.
+
+    All three persistent benefits (income/atk/def) are multiplied by
+    HORIZON_TICKS because they all produce value every tick for the
+    lifetime of the spend — income literally pays out, stat gains earn
+    gold indirectly via auto-farming.  The strategy weights convert stat
+    points to 'gold-equivalent per tick' so they can sit on the same axis
+    as income.  xp_delta is one-shot (level progress) and not multiplied.
+    """
+    b = opt.get("benefits", {})
+    value = (
+        float(b.get("income_delta", 0)) * w.get("w_income", 0) * HORIZON_TICKS
+        + float(b.get("atk_delta",   0)) * w.get("w_atk",    0) * HORIZON_TICKS
+        + float(b.get("def_delta",   0)) * w.get("w_def",    0) * HORIZON_TICKS
+        + float(b.get("xp_delta",    0)) * w.get("w_xp",     0)
+    )
+    cost = max(int(opt.get("cost", 0)), 1)
+    return value / cost
+
+
+# ── Unit stat helpers (used by option generators) ────────────────────────────
+def _gear_stat(unit, slot, tier):
+    """Return the stat value for a given gear piece."""
+    if unit in ("spy", "sentry"):
+        table = SPY_WEAPON if slot == "weapon" else SPY_ARMOR
+    else:
+        table = WEAPON_STATS if slot == "weapon" else ARMOR_STATS
+    return table.get(tier, 0)
+
+def _unit_stat_adds_to(unit):
+    """Return ('atk'|'def'|'spy_off'|'spy_def') — which stat this unit type
+    contributes to when given gear.  Used to route gear stat deltas."""
+    return {
+        "soldier": "atk",
+        "guard":   "def",
+        "spy":     "atk",   # spy_off — we lump into atk for scoring simplicity
+        "sentry":  "def",   # spy_def — lumped into def
+    }.get(unit, "atk")
+
+def _unit_base_stat(unit, player_lv):
+    """Base stat per fully-trained unit at current max unit tier."""
+    ut = max_unit_tier(player_lv)
+    if unit == "soldier": return UNIT_OFF.get(ut, 0)
+    if unit == "guard":   return UNIT_DEF.get(ut, 0)
+    if unit == "spy":     return UNIT_SPY.get(min(ut, 3), 0)
+    if unit == "sentry":  return UNIT_SENT.get(min(ut, 3), 0)
+    return 0
+
+
+# ── Option generators ─────────────────────────────────────────────────────────
+def _gen_build_options(state):
+    """One option per eligible building-level upgrade."""
+    out = []
+    builds   = state.get("buildings", {})
+    level    = state.get("level", 1)
+    workers  = state.get("workers", 0)
+    income   = state.get("income", 0)
+    units    = sum(state.get(k, 0) for k in ("soldiers", "guards", "spies", "sentries"))
+
+    for bname, req_lv, base_cost, max_lv, btype in BUILDINGS:
+        cur_lv = builds.get(bname, 0)
+        if cur_lv >= max_lv or level < req_lv:
+            continue
+        # Prereq check (e.g., Mine Lv2 needs Fortification Lv1)
+        prereq = BUILDING_PREREQ.get((bname, cur_lv + 1), {})
+        if any(builds.get(b, 0) < req for b, req in prereq.items()):
+            continue
+
+        cost = base_cost * (cur_lv + 1)
+        benefits = {"income_delta": 0, "atk_delta": 0, "def_delta": 0, "xp_delta": 0}
+
+        if bname == "Mine":
+            # Each mine level adds 10% to (base_inc + workers * WORKER_GOLD).
+            # Income delta = current_base_production * 0.10
+            base_prod = BASE_INC + workers * WORKER_GOLD
+            benefits["income_delta"] = int(base_prod * 0.10)
+        elif bname == "Housing":
+            # Housing adds citizen slots; we assume ~80% of new slots become
+            # workers that produce WORKER_GOLD/tick at current mine multiplier.
+            # Slot count per level is ~100 (heuristic).
+            new_slots = 100
+            benefits["income_delta"] = int(
+                new_slots * 0.80 * WORKER_GOLD * mine_mult(est_mine_lv(level))
+            )
+        elif bname == "Armory":
+            # Armory unlocks higher gear tiers.  We approximate the stat gain
+            # as "every existing army unit could tier up by ~50 stat points".
+            # This is a rough surrogate for the real upgrade opportunity.
+            benefits["atk_delta"] = units * 25
+            benefits["def_delta"] = units * 25
+        elif bname == "Fortification":
+            # Fortification adds fort HP + unlocks higher unit tiers.
+            benefits["def_delta"] = units * 20
+        # Spy Academy, Mercenary Camp, Barracks: no direct scored benefit
+
+        out.append({
+            "type":     "BUILD",
+            "cost":     cost,
+            "benefits": benefits,
+            "reason":   f"{bname} Lv{cur_lv}→Lv{cur_lv+1}",
+            "name":     bname,
+            "lv":       cur_lv + 1,
+        })
+    return out
+
+
+def _gen_gear_buy_options(state, cats):
+    """One option per (unit, slot) where units are currently under-equipped
+    at their current tier.  Buys enough gear to fill the gap (or as much as
+    current gold allows)."""
+    out = []
+    gold = state.get("gold", 0)
+    for cat in cats:
+        unit  = cat["unit"]
+        units = cat["units"]
+        if units <= 0:
+            continue
+        for slot, gap, tier in [
+            ("weapon", cat["w_gap"], cat["w_tier"]),
+            ("armor",  cat["a_gap"], cat["a_tier"]),
+        ]:
+            if gap <= 0 or tier not in GEAR.get((unit, slot), {}):
+                continue
+            name, stat, cost_per = GEAR[(unit, slot)][tier]
+            if cost_per <= 0:
+                continue
+            qty = min(gap, gold // cost_per)
+            if qty <= 0:
+                continue
+            total = cost_per * qty
+            benefits = {"income_delta": 0, "atk_delta": 0, "def_delta": 0, "xp_delta": 0}
+            key = "atk_delta" if _unit_stat_adds_to(unit) == "atk" else "def_delta"
+            benefits[key] = stat * qty
+            out.append({
+                "type":     "BUY_GEAR",
+                "cost":     total,
+                "benefits": benefits,
+                "reason":   f"Fill {qty}× {unit} {slot} gap @ T{tier}",
+                "unit":     unit,
+                "slot":     slot,
+                "tier":     tier,
+                "qty":      qty,
+                "name":     name,
+                "total":    total,
+                "tab":      ARMORY_TAB[unit],
+            })
+    return out
+
+
+def _gen_gear_upgrade_options(state, cats):
+    """One option per (unit, slot, tier→tier+1) where the unit type has
+    equipped gear below its max buyable tier."""
+    out = []
+    gold = state.get("gold", 0)
+    for cat in cats:
+        unit  = cat["unit"]
+        units = cat["units"]
+        if units <= 0:
+            continue
+        for slot in ("weapon", "armor"):
+            cur_t    = cat["w_tier"] if slot == "weapon" else cat["a_tier"]
+            slot_max = cat["w_max_t"] if slot == "weapon" else cat["a_max_t"]
+            equipped = cat.get("w_owned" if slot == "weapon" else "a_owned", 0)
+            if equipped <= 0 or cur_t >= slot_max:
+                continue
+            # Walk to next tier that exists in the GEAR table.
+            next_t = cur_t + 1
+            while next_t <= slot_max and next_t not in GEAR.get((unit, slot), {}):
+                next_t += 1
+            if next_t > slot_max:
+                continue
+            _, _, old_cost = GEAR[(unit, slot)].get(cur_t,  (None, 0, 0))
+            new_name, new_stat, new_cost = GEAR[(unit, slot)][next_t]
+            old_stat = _gear_stat(unit, slot, cur_t)
+            delta_cost_per_unit = new_cost - old_cost
+            if delta_cost_per_unit <= 0:
+                continue
+            qty = min(equipped, gold // delta_cost_per_unit)
+            if qty <= 0:
+                continue
+            total = delta_cost_per_unit * qty
+            stat_delta_total = (new_stat - old_stat) * qty
+            benefits = {"income_delta": 0, "atk_delta": 0, "def_delta": 0, "xp_delta": 0}
+            key = "atk_delta" if _unit_stat_adds_to(unit) == "atk" else "def_delta"
+            benefits[key] = stat_delta_total
+            out.append({
+                "type":     "UPGRADE_GEAR",
+                "cost":     total,
+                "benefits": benefits,
+                "reason":   f"Upgrade {qty}× {unit} {slot} T{cur_t}→T{next_t}",
+                "unit":     unit,
+                "slot":     slot,
+                "tier":     next_t,
+                "qty":      qty,
+                "name":     new_name,
+                "total":    total,
+                "tab":      ARMORY_TAB[unit],
+            })
+    return out
+
+
+def _gen_train_options(state, cats):
+    """One option per unit type, training up to (idle_citizens) new units
+    and immediately gearing them at max buyable tier."""
+    out = []
+    citizens = state.get("citizens", 0)
+    gold     = state.get("gold", 0)
+    level    = state.get("level", 1)
+    mine_lv  = state.get("mine_lv", est_mine_lv(level))
+    if citizens <= 0:
+        return out
+
+    for unit in ("worker", "soldier", "guard", "spy", "sentry"):
+        if unit == "worker":
+            # Train bare workers.  Income_delta per worker = WORKER_GOLD * mine_mult
+            cost_per = UNIT_COST[unit]
+            qty = min(citizens, gold // cost_per)
+            if qty <= 0:
+                continue
+            total = cost_per * qty
+            income_per = int(WORKER_GOLD * mine_mult(mine_lv))
+            out.append({
+                "type":     "TRAIN",
+                "cost":     total,
+                "benefits": {"income_delta": income_per * qty, "atk_delta": 0,
+                             "def_delta": 0, "xp_delta": 0},
+                "reason":   f"Train {qty} workers",
+                "unit":     unit,
+                "count":    qty,
+            })
+            continue
+
+        # Combat unit: cost = UNIT_COST + weapon + armor at max buyable tier
+        wc, ac, mt_w, mt_a = _gear_cost_for_unit(state, unit)
+        full_cost = UNIT_COST[unit] + wc + ac
+        if full_cost <= 0:
+            continue
+        qty = min(citizens, gold // full_cost)
+        if qty <= 0:
+            continue
+        total = full_cost * qty
+
+        # Benefits: base stat + weapon + armor, routed to atk or def.
+        base_stat = _unit_base_stat(unit, level)
+        weap_stat = _gear_stat(unit, "weapon", mt_w)
+        arm_stat  = _gear_stat(unit, "armor",  mt_a)
+        per_unit_stat = base_stat + weap_stat + arm_stat
+        total_stat    = per_unit_stat * qty
+        benefits = {"income_delta": 0, "atk_delta": 0, "def_delta": 0, "xp_delta": 0}
+        key = "atk_delta" if _unit_stat_adds_to(unit) == "atk" else "def_delta"
+        benefits[key] = total_stat
+        out.append({
+            "type":     "TRAIN",
+            "cost":     total,
+            "benefits": benefits,
+            "reason":   f"Train {qty}× {unit} +T{mt_w}/T{mt_a} gear",
+            "unit":     unit,
+            "count":    qty,
+            "w_max_t":  mt_w,
+            "a_max_t":  mt_a,
+        })
+    return out
+
+
+def _gen_battle_upgrade_options(state):
+    """Battle upgrades (Strength, Constitution, etc.) multiply existing stats.
+    Value scales with your current power, so they're valuable even early.
+    Capped to 1 per tick by decide_v2 so they can't dominate the plan."""
+    out = []
+    upgrades = state.get("upgrades_buyable", {})
+    if not upgrades:
+        return out
+
+    cur_atk    = state.get("atk",     0)
+    cur_def    = state.get("def",     0)
+    cur_income = state.get("income",  0)
+
+    # Heuristic mapping: upgrade name → (stat bonus %, target stat).
+    # Real percentages come from the game; these are conservative estimates.
+    for upg_name, upg_info in upgrades.items():
+        cost = upg_info.get("cost", 0) if isinstance(upg_info, dict) else upg_info
+        if not cost or cost <= 0:
+            continue
+        benefits = {"income_delta": 0, "atk_delta": 0, "def_delta": 0, "xp_delta": 0}
+        n = upg_name.lower()
+        if "strength" in n or "offense" in n or "attack" in n:
+            benefits["atk_delta"] = int(cur_atk * 0.05)
+        elif "constitution" in n or "defense" in n or "defence" in n:
+            benefits["def_delta"] = int(cur_def * 0.05)
+        elif "charisma" in n or "income" in n or "wealth" in n:
+            benefits["income_delta"] = int(cur_income * 0.05)
+        else:
+            # Unknown upgrade — assume balanced 3% boost.
+            benefits["atk_delta"] = int(cur_atk * 0.03)
+            benefits["def_delta"] = int(cur_def * 0.03)
+
+        out.append({
+            "type":     "BUY_UPGRADE",
+            "cost":     cost,
+            "benefits": benefits,
+            "reason":   f"Battle upgrade: {upg_name}",
+            "name":     upg_name,
+            "qty":      1,
+            "total":    cost,
+        })
+    return out
+
+
+def generate_spend_options(state, cats):
+    """Assemble all candidate spend options for this tick."""
+    out = []
+    out += _gen_build_options(state)
+    out += _gen_gear_buy_options(state, cats)
+    out += _gen_gear_upgrade_options(state, cats)
+    out += _gen_train_options(state, cats)
+    out += _gen_battle_upgrade_options(state)
+    return out
+
+
+# ── Main entry point ─────────────────────────────────────────────────────────
+def decide_v2(s, cats, strategy=None):
+    """Marginal-value decision engine.
+
+    Returns (actions_list, gold_left).  Drop-in replacement for decide().
+
+    Strategy bias is applied via STRATEGY_WEIGHTS[key] — weights multiply the
+    per-option benefit values in score_option().  Legacy strategy keys are
+    automatically mapped (balanced→grow, attack→combat, etc.).
+    """
+    strategy_key = _normalize_strategy_key(strategy or load_strategy())
+    w = STRATEGY_WEIGHTS.get(strategy_key, STRATEGY_WEIGHTS[DEFAULT_STRATEGY_V2])
+    label = {"grow": "📈  Grow", "combat": "⚔️  Combat", "defend": "🛡️  Defend"}[strategy_key]
+    print(f"  📋 Strategy: {label} (decide_v2 engine)")
+
+    gold_left = s["gold"]
+    actions   = []
+
+    # ── 1. Fort repair (unconditional safety pre-pass) ──────────────────────
+    fort_dmg = s.get("fort_max_hp", 100) - s.get("fort_hp", 100)
+    if fort_dmg > 0:
+        repair_cost = int(fort_dmg * s.get("cost_per_hp", 16.75)) + 1
+        if gold_left >= repair_cost:
+            actions.append({
+                "type":   "REPAIR_FORT",
+                "damage": fort_dmg,
+                "cost":   repair_cost,
+                "reason": f"fort at {s.get('fort_pct', 100)}% HP",
+            })
+            gold_left -= repair_cost
+
+    # ── 2. Generate, score, sort ────────────────────────────────────────────
+    options = generate_spend_options(s, cats)
+    for opt in options:
+        opt["score"] = score_option(opt, w)
+    options.sort(key=lambda o: -o["score"])
+
+    # Optional verbose dump of the top-10 for tuning.
+    if os.environ.get("DECIDE_VERBOSE"):
+        print(f"  🔬 Top spend options (strategy={strategy_key}):")
+        for opt in options[:10]:
+            b = opt["benefits"]
+            print(f"     score={opt['score']:8.2f}  cost={opt['cost']:>10,}  "
+                  f"income+={b['income_delta']:>5}  atk+={b['atk_delta']:>6}  "
+                  f"def+={b['def_delta']:>6}  {opt['reason']}")
+
+    # ── 3. Greedy select within budget ──────────────────────────────────────
+    MAX_ACTIONS_PER_TICK  = 12
+    MAX_BATTLE_UPGRADES   = 1   # cap so one big upgrade doesn't eat all gold
+    battle_upgrades_used  = 0
+
+    for opt in options:
+        if len(actions) >= MAX_ACTIONS_PER_TICK + 1:   # +1 for fort repair
+            break
+        if opt["score"] <= 0:
+            break   # nothing useful left
+        if opt["cost"] > gold_left:
+            continue   # unaffordable, try next
+        if opt["type"] == "BUY_UPGRADE":
+            if battle_upgrades_used >= MAX_BATTLE_UPGRADES:
+                continue
+            battle_upgrades_used += 1
+        actions.append(opt)
+        gold_left -= opt["cost"]
+
+    # ── 4. Bank residue ─────────────────────────────────────────────────────
+    # Only deposit if there's enough left to be worth a navigation round-trip.
+    if gold_left >= 50_000:
+        actions.append({
+            "type":   "BANK",
+            "amount": gold_left,
+            "cost":   0,
+            "reason": f"deposit {gold_left:,}g residue",
+        })
+
+    return actions, gold_left
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# END MARGINAL-VALUE ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+
 # ── EXECUTE ACTIONS ────────────────────────────────────────────────────────────
 def execute(page, actions, gold):
     for a in actions:
@@ -1382,8 +1855,13 @@ def run_tick():
                   f"max_tier=T{c['max_t']} {status}")
         print()
 
-        # Decide
-        actions, gold_after = decide(s, cats)
+        # Decide — marginal-value engine (decide_v2) unless flagged off.
+        # The legacy decide() is kept in-file as a rollback safety net;
+        # flip USE_DECIDE_V2 to False at the top of optimizer.py to revert.
+        if USE_DECIDE_V2:
+            actions, gold_after = decide_v2(s, cats)
+        else:
+            actions, gold_after = decide(s, cats)
         print("  🧠 DECISIONS:")
         for a in actions:
             icon = {"BUILD":"🏗️","BUY_GEAR":"⚔️","UPGRADE_GEAR":"⬆️","TRAIN":"🪖",

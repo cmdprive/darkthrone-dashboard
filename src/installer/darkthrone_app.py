@@ -123,14 +123,24 @@ DASH_FILE   = "index.html"
 RACES   = ["Human", "Goblin", "Elf", "Undead"]
 CLASSES = ["Fighter", "Cleric", "Thief", "Assassin"]
 
-# Must match STRATEGIES keys in optimizer.py
+# Must match STRATEGY_WEIGHTS keys in optimizer.py (decide_v2 engine).
+# Legacy keys (balanced/attack/defense/economy/spy/hybrid) are auto-migrated
+# to the new 3-profile set at config-load time via _LEGACY_STRAT_MAP below.
 STRATEGY_LABELS = {
-    "balanced": {"label": "⚖️  Balanced",   "desc": "Even spread — workers, soldiers, guards, spies, sentries"},
-    "attack":   {"label": "⚔️  Attack",     "desc": "Heavy soldiers — max offense, light defense"},
-    "defense":  {"label": "🛡️  Defense",    "desc": "Heavy guards — max defense, light offense"},
-    "economy":  {"label": "💰  Economy",    "desc": "Max workers and income buildings, minimal army"},
-    "spy":      {"label": "🗡️  Spy",        "desc": "Heavy spies and sentries, intelligence focused"},
-    "hybrid":   {"label": "⚔️🛡️  Hybrid",  "desc": "Soldiers + guards only, skip spy units"},
+    "grow":   {"label": "📈  Grow",   "desc": "Net worth focus — income + cheap army + XP for unlocks"},
+    "combat": {"label": "⚔️  Combat", "desc": "ATK-heavy — maximize offensive power for farming + PvP"},
+    "defend": {"label": "🛡️  Defend", "desc": "DEF-heavy — survive attacks, protect bank + rank"},
+}
+
+# Legacy → new strategy key migration.  Any old user_config.json with
+# strategy="balanced" is silently rewritten to "grow" on first load.
+_LEGACY_STRAT_MAP = {
+    "balanced": "grow",
+    "economy":  "grow",
+    "attack":   "combat",
+    "spy":      "combat",
+    "defense":  "defend",
+    "hybrid":   "defend",
 }
 
 C = {                         # colour palette
@@ -187,14 +197,28 @@ class DarkThroneApp:
 
     # ── Config ────────────────────────────────────────────────────────────────
     def _load_config(self):
+        cfg = {"race": "Human", "class": "Fighter", "strategy": "grow"}
         if os.path.isfile(CONFIG_FILE):
             try:
                 _unhide_file(CONFIG_FILE)
                 with open(CONFIG_FILE, encoding="utf-8") as f:
-                    return json.load(f)
+                    cfg = json.load(f)
             except Exception:
                 pass
-        return {"race": "Human", "class": "Fighter"}
+        # Migrate legacy strategy keys (balanced/attack/etc.) to the new
+        # 3-profile names used by decide_v2.
+        legacy = cfg.get("strategy")
+        if legacy in _LEGACY_STRAT_MAP:
+            cfg["strategy"] = _LEGACY_STRAT_MAP[legacy]
+            try:
+                _unhide_file(CONFIG_FILE)
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=2)
+            except Exception:
+                pass
+        elif legacy not in STRATEGY_LABELS:
+            cfg["strategy"] = "grow"
+        return cfg
 
     def _save_config_file(self):
         try:
