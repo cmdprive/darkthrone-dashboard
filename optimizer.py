@@ -2882,7 +2882,9 @@ ARMORY_LV_TO_GEAR_TIER = {0:3, 1:5, 2:7, 3:9, 4:10, 5:10}
 FORT_LV_TO_GEAR_TIER   = {0:3, 1:5, 2:7, 3:9, 4:10, 5:10}
 
 # Fort Lv → max UNIT tier
-FORT_LV_TO_UNIT_TIER   = {0:1, 1:2, 2:3, 3:4, 4:4, 5:4}
+# Fort Lv1 only adds fort HP — T2 units require Fort Lv2 (Player Level 20, CONFIRMED)
+# Pattern: each fort level unlocks the next unit tier.
+FORT_LV_TO_UNIT_TIER   = {0:1, 1:1, 2:2, 3:3, 4:4, 5:4}
 
 # Spy Academy Lv → max spy gear tier (mirrors armory progression)
 SPY_AC_TO_SPY_TIER     = {0:3, 1:5, 2:7, 3:9, 4:10, 5:10}
@@ -2916,7 +2918,7 @@ def est_armory_lv(player_lv):
       Lv3: ~Player Level 50 (estimated) (T8–T9 gear)
       Lv4: ~Player Level 70 (estimated) (T10 gear)
       Lv5: ~Player Level 90 (estimated) (T10 maxed)
-    No player on this server (max Lv21 as of 2026-04-08) has Armory Lv2."""
+    Mungus (Lv30, confirmed 2026-04-15) is the first known player with Armory Lv2."""
     if player_lv < 10: return 0
     if player_lv < 30: return 1   # T4–T5 cap for ALL current players
     if player_lv < 50: return 2   # T6–T7  (Player Lv30 confirmed)
@@ -2925,14 +2927,21 @@ def est_armory_lv(player_lv):
     return 5
 
 def est_fort_lv(player_lv):
-    """Fortification level tracks armory (fort is cheaper so reaches each
-    level slightly earlier, but confirmed Fort Lv1 is req. for Armory Lv2)."""
+    """Fortification player-level requirements (confirmed + estimated):
+      Lv1: Player Level 10              ← CONFIRMED
+      Lv2: Player Level 20, 3.00M gold  ← CONFIRMED (screenshot 2026-04-15)
+      Lv3: ~Player Level 30 (estimated — +10 level pattern, fort costs 500k×lv)
+      Lv4: ~Player Level 40 (estimated)
+      Lv5: ~Player Level 50 (estimated)
+    Fort upgrades every ~10 player levels (vs Armory every ~20) because fort
+    costs ~500k×lv vs Armory ~750k×lv.
+    T2 units open at Fort Lv2 (player lv 20) — CONFIRMED by user."""
     if player_lv < 10: return 0
-    if player_lv < 30: return 1   # matches armory gate
-    if player_lv < 50: return 2
-    if player_lv < 70: return 3
-    if player_lv < 90: return 4
-    return 5
+    if player_lv < 20: return 1   # Fort Lv1 — only HP bonus, no new unit tier
+    if player_lv < 30: return 2   # Fort Lv2 — T2 units unlock (player lv 20 confirmed)
+    if player_lv < 40: return 3   # Fort Lv3 — T3 units (estimated)
+    if player_lv < 50: return 4   # Fort Lv4 — T4 units (estimated)
+    return 5                       # Fort Lv5 — T4 units max (estimated)
 
 def est_spy_ac_lv(player_lv):
     """Spy Academy requires Player Level 5 for Lv1.
@@ -4278,13 +4287,18 @@ def estimator_run():
     # Gear tier explanation
     your_lv = you.get('level', 2)
     # Level thresholds match est_armory_lv / est_fort_lv gates:
-    #   Lv < 10  → Armory/Fort Lv0 → T3 gear
-    #   Lv 10-29 → Armory/Fort Lv1 → T5 gear  (CONFIRMED: Armory Lv2 req. Player Lv30)
-    #   Lv 30-49 → Armory/Fort Lv2 → T7 gear  (user confirmed T6+T7 opens at Lv30)
-    #   Lv 50-69 → Armory/Fort Lv3 → T9 gear  (estimated)
-    #   Lv 70+   → Armory/Fort Lv4 → T10 gear (estimated)
-    tier_rows = [(2, 'T1 unit + T3 gear'), (10, 'T2 unit + T5 gear'),
-                 (30, 'T3 unit + T7 gear'), (50, 'T4 unit + T9 gear'), (70, 'T4 unit + T10 gear')]
+    #   Lv  2- 9 → Fort Lv0, Armory Lv0 → T1 unit + T3 gear
+    #   Lv 10-19 → Fort Lv1, Armory Lv1 → T1 unit + T5 gear  (fort adds HP only, not new units)
+    #   Lv 20-29 → Fort Lv2, Armory Lv1 → T2 unit + T5 gear  (T2 units CONFIRMED at Fort Lv2/Lv20)
+    #   Lv 30-49 → Fort Lv3, Armory Lv2 → T3 unit + T7 gear  (Armory Lv2 CONFIRMED at Lv30)
+    #   Lv 50-69 → Fort Lv5, Armory Lv3 → T4 unit + T9 gear  (estimated)
+    #   Lv 70+   → Fort Lv5, Armory Lv4 → T4 unit + T10 gear (estimated)
+    tier_rows = [(2,  'T1 unit + T3 gear'),
+                 (10, 'T1 unit + T5 gear'),
+                 (20, 'T2 unit + T5 gear'),
+                 (30, 'T3 unit + T7 gear'),
+                 (50, 'T4 unit + T9 gear'),
+                 (70, 'T4 unit + T10 gear')]
     print(f'\n  GEAR TIER SUMMARY (stat per fully-geared unit):')
     for lv, label in tier_rows:
         you_tag = '  ← YOU' if lv <= your_lv < (tier_rows[tier_rows.index((lv,label))+1][0]
