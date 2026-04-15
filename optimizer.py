@@ -2687,9 +2687,32 @@ def scrape_rankings(page, ts):
     """
     print("  🏆 Scraping global rankings...")
 
-    # JS that extracts all .ranking-row entries from the current page
+    # JS that extracts podium (ranks 1-3) AND .ranking-row entries (ranks 4+)
+    # from the current page.  The podium uses a DIFFERENT HTML structure —
+    # .podium-spot / .podium-name / .podium-base-N — and was previously ignored,
+    # which meant the scraper was silently dropping the top-3 players every tick.
     EXTRACT_JS = r"""() => {
         const rows = [];
+
+        // ── Top-3 podium (rank 1, 2, 3 — different HTML structure) ──────────
+        document.querySelectorAll('.podium-spot').forEach(spot => {
+            const nameEl   = spot.querySelector('.podium-name');
+            const playerEl = spot.querySelector('.podium-player');
+            const baseEl   = spot.querySelector('[class*="podium-base-"]');
+            if (!nameEl || !baseEl) return;
+            const rank = parseInt((baseEl.innerText || '').trim());
+            if (!rank) return;
+            // .podium-name has only the player name as text (no badges)
+            const name = (nameEl.innerText || '').trim();
+            const href = playerEl ? (playerEl.getAttribute('href') || '') : '';
+            const idM  = href.match(/\/player\/(\d+)/);
+            const pid  = idM ? parseInt(idM[1]) : 0;
+            const clanEl = spot.querySelector('.podium-clan');
+            const clan = (clanEl ? clanEl.innerText || '' : '').replace(/[\[\]]/g,'').trim();
+            if (name && rank) rows.push({rank, name, pid, clan});
+        });
+
+        // ── Regular ranking rows (rank 4+) ──────────────────────────────────
         document.querySelectorAll('.ranking-row').forEach(row => {
             const posEl  = row.querySelector('.ranking-position');
             const nameEl = row.querySelector('.player-name');
@@ -3060,17 +3083,61 @@ def _fit_exponential(rank1, val1, rank2, val2):
     return (A, k) if A > 0 and k > 0 else (0.0, 0.0)
 
 
-def _seed_model(points: list, base_k: float, label: str):
+def _seed_model(points: list, base_k: float, label: str, your_point=None):
     """Fit or seed a model from a list of (rank, value) confirmed points.
-    Returns (A, k). Uses two points for a full fit, one point for a seed."""
-    points = sorted(p for p in points if p[0] > 0 and p[1] > 0)
+    Returns (A, k).
+
+    Strategy:
+      1. Filter out rank >= 900 sentinels (= "rank unknown") and non-positive values.
+      2. If 2+ points, find ALL valid pairs (A>0, k>0) and pick the BEST one:
+         - First preference: pairs that include YOUR own (rank, stat) anchor,
+           because that anchor is guaranteed to be fresh and exact this tick.
+         - Second preference: widest rank-span (largest r2-r1).  Wide spans
+           give a much more reliable slope estimate than adjacent-rank pairs,
+           which amplify local noise and overshoot k.
+      3. If no valid pair exists, fall back to a 1-point seed using the
+         highest-VALUE point.  Since confirmed stats are FLOORS, the highest
+         floor is the most current/binding anchor we have.
+      4. If only one point exists, seed directly from it.
+    """
+    points = sorted(p for p in points if p[0] > 0 and 0 < p[0] < 900 and p[1] > 0)
+
+    def _is_your(p):
+        return your_point is not None and p == your_point
+
     if len(points) >= 2:
-        A, k = _fit_exponential(points[0][0], points[0][1],
-                                  points[1][0], points[1][1])
-        if A > 0 and k > 0:
+        candidates = []   # (has_your, span, A, k, p1, p2)
+        for i in range(len(points)):
+            for j in range(i + 1, len(points)):
+                p1, p2 = points[i], points[j]
+                A, k = _fit_exponential(p1[0], p1[1], p2[0], p2[1])
+                if A > 0 and k > 0:
+                    span = p2[0] - p1[0]
+                    has_your = _is_your(p1) or _is_your(p2)
+                    candidates.append((has_your, span, A, k, p1, p2))
+        if candidates:
+            # Prefer pairs with YOUR anchor, then widest span.
+            candidates.sort(key=lambda c: (not c[0], -c[1]))
+            has_your, span, A, k, p1, p2 = candidates[0]
+            tag = " [YOUR]" if has_your else ""
             print(f"     📐 {label} calibrated:  A={A:,.0f} k={k:.4f} "
-                  f"(pts: {points[0]}, {points[1]})")
+                  f"(pts: {p1}, {p2}, span={span}){tag}")
             return A, k
+        # No valid pair — all points contradict each other (stale confirmed data).
+        # Prefer YOUR point for the 1-point seed; else use the highest-value floor.
+        if your_point and your_point[0] > 0 and your_point[1] > 0 and your_point[0] < 900:
+            r, v = your_point
+            note = "YOUR live anchor"
+        else:
+            best = max(points, key=lambda p: p[1])
+            r, v = best
+            note = "highest-value floor"
+        k = base_k
+        A = v / math.exp(-k * r)
+        print(f"     ⚠️  {label}: no valid 2-pt fit — seeding from {note}")
+        print(f"     📐 {label} seeded (fallback 1pt): A={A:,.0f} k={k:.4f} "
+              f"(rank={r}, val={v:,})")
+        return A, k
     if len(points) == 1:
         r, v = points[0]
         k = base_k
@@ -3135,50 +3202,74 @@ def calibrate_models(profiles: dict, you: dict = None):
         dr  = p.get('def_rank',     0) or cs.get('def_rank',     0)
         sor = p.get('spy_off_rank', 0) or cs.get('spy_off_rank', 0)
         sdr = p.get('spy_def_rank', 0) or cs.get('spy_def_rank', 0)
-        if ar  > 0 and cs.get('atk',     0): atk_pts.append((ar,  cs['atk']))
-        if dr  > 0 and cs.get('def',     0): def_pts.append((dr,  cs['def']))
-        if sor > 0 and cs.get('spy_off', 0): spo_pts.append((sor, cs['spy_off']))
-        if sdr > 0 and cs.get('spy_def', 0): spd_pts.append((sdr, cs['spy_def']))
+        # Filter sentinel rank 999 ("unknown rank") and 0 at point-collection time.
+        if 0 < ar  < 900 and cs.get('atk',     0): atk_pts.append((ar,  cs['atk']))
+        if 0 < dr  < 900 and cs.get('def',     0): def_pts.append((dr,  cs['def']))
+        if 0 < sor < 900 and cs.get('spy_off', 0): spo_pts.append((sor, cs['spy_off']))
+        if 0 < sdr < 900 and cs.get('spy_def', 0): spd_pts.append((sdr, cs['spy_def']))
 
     # Add YOUR live stats as the most-reliable anchor point
     # (rank scraped this tick from the server, stat read directly from the game)
+    your_atk_pt = your_def_pt = your_spo_pt = your_spd_pt = None
     if you:
         r_atk = you.get('rank_offense', 0)
         r_def = you.get('rank_defense', 0)
         if r_atk > 0 and you.get('atk', 0) > 0:
-            atk_pts.append((r_atk, you['atk']))
+            your_atk_pt = (r_atk, you['atk'])
+            atk_pts.append(your_atk_pt)
             print(f"     📌 ATK anchor: rank #{r_atk} = {you['atk']:,}  (your live stats)")
         if r_def > 0 and you.get('def', 0) > 0:
-            def_pts.append((r_def, you['def']))
+            your_def_pt = (r_def, you['def'])
+            def_pts.append(your_def_pt)
             print(f"     📌 DEF anchor: rank #{r_def} = {you['def']:,}  (your live stats)")
+        # Spy ranks from /stats page — only included when we actually scraped them
+        r_spo = you.get('rank_spy_off', 0)
+        r_spd = you.get('rank_spy_def', 0)
+        if r_spo > 0 and you.get('spy_off', 0) > 0:
+            your_spo_pt = (r_spo, you['spy_off'])
+            spo_pts.append(your_spo_pt)
+        if r_spd > 0 and you.get('spy_def', 0) > 0:
+            your_spd_pt = (r_spd, you['spy_def'])
+            spd_pts.append(your_spd_pt)
 
-    MAX_K = 0.05   # cap: prevents rank-1 estimates from being absurdly large
+    MAX_K = 0.10   # cap: prevents absurdly steep curves while still allowing
+                   # steep-but-real slopes from wide-span fits (e.g. ATK 0.09)
 
-    def _set_model(pts, A, k, label):
-        """Cap k at MAX_K and re-anchor A to the best (lowest-rank) point so that
-        rank_*(best_rank) == best_value after capping.  Without re-anchoring, A
-        stays at the pre-cap fit value which makes rank_atk(1) >> confirmed rank-1."""
+    def _set_model(pts, A, k, label, your_pt=None):
+        """Cap k at MAX_K and re-anchor A.
+        Preference order for the re-anchor point:
+          1. YOUR own live (rank, stat) — always fresh and exact this tick
+          2. Highest-VALUE point — the biggest floor we know, most current
+        We never re-anchor to the lowest-RANK point because that point is
+        often stale confirmed data from days ago."""
         k_c = min(k, MAX_K)
         if k > MAX_K and pts:
-            valid = sorted(p for p in pts if p[0] > 0 and p[1] > 0)
-            if valid:
-                r0, v0 = valid[0]   # lowest rank number = highest-ranked player
-                A = v0 / math.exp(-k_c * r0)
-                print(f"     🔧 {label}: k capped {k:.4f}→{k_c:.4f}, "
-                      f"A re-anchored to rank {r0}={v0:,} → A={A:,.0f}")
+            if your_pt and your_pt[0] > 0 and your_pt[1] > 0 and your_pt[0] < 900:
+                r0, v0 = your_pt
+                src = "YOUR live"
+            else:
+                valid = [p for p in pts if 0 < p[0] < 900 and p[1] > 0]
+                if not valid:
+                    return A, k_c
+                best = max(valid, key=lambda p: p[1])
+                r0, v0 = best
+                src = "highest-value"
+            A = v0 / math.exp(-k_c * r0)
+            print(f"     🔧 {label}: k capped {k:.4f}→{k_c:.4f}, "
+                  f"A re-anchored to {src} rank {r0}={v0:,} → A={A:,.0f}")
         return A, k_c
 
-    A, k = _seed_model(atk_pts, ATK_RANK_K, 'ATK model')
-    if A: ATK_RANK_A, ATK_RANK_K = _set_model(atk_pts, A, k, 'ATK')
+    A, k = _seed_model(atk_pts, ATK_RANK_K, 'ATK model', your_point=your_atk_pt)
+    if A: ATK_RANK_A, ATK_RANK_K = _set_model(atk_pts, A, k, 'ATK', your_pt=your_atk_pt)
 
-    A, k = _seed_model(def_pts, DEF_RANK_K, 'DEF model')
-    if A: DEF_RANK_A, DEF_RANK_K = _set_model(def_pts, A, k, 'DEF')
+    A, k = _seed_model(def_pts, DEF_RANK_K, 'DEF model', your_point=your_def_pt)
+    if A: DEF_RANK_A, DEF_RANK_K = _set_model(def_pts, A, k, 'DEF', your_pt=your_def_pt)
 
-    A, k = _seed_model(spo_pts, ATK_RANK_K, 'SpyOff model')
-    if A: SPY_OFF_RANK_A, SPY_OFF_RANK_K = _set_model(spo_pts, A, k, 'SpyOff')
+    A, k = _seed_model(spo_pts, ATK_RANK_K, 'SpyOff model', your_point=your_spo_pt)
+    if A: SPY_OFF_RANK_A, SPY_OFF_RANK_K = _set_model(spo_pts, A, k, 'SpyOff', your_pt=your_spo_pt)
 
-    A, k = _seed_model(spd_pts, DEF_RANK_K, 'SpyDef model')
-    if A: SPY_DEF_RANK_A, SPY_DEF_RANK_K = _set_model(spd_pts, A, k, 'SpyDef')
+    A, k = _seed_model(spd_pts, DEF_RANK_K, 'SpyDef model', your_point=your_spd_pt)
+    if A: SPY_DEF_RANK_A, SPY_DEF_RANK_K = _set_model(spd_pts, A, k, 'SpyDef', your_pt=your_spd_pt)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def read_csv(path):
