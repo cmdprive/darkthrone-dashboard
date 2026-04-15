@@ -23,6 +23,19 @@ _os.chdir(_ROOT)
 _sys.path.insert(0, _ROOT)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Playwright browser cache redirect (frozen bundle only) ───────────────────
+# When PyInstaller bundles Playwright, the driver looks for Chromium at
+#   <bundle>\_internal\playwright\driver\package\.local-browsers\chromium-<ver>\
+# but we don't ship the 150MB browser binaries.  At runtime, point Playwright
+# at the user's default cache where `install_browser.bat` installs them via
+# `python -m playwright install chromium`.  Must run BEFORE playwright imports.
+if getattr(_sys, "frozen", False) and _sys.platform == "win32":
+    _local = _os.environ.get("LOCALAPPDATA", "")
+    if _local:
+        _cache = _os.path.join(_local, "ms-playwright")
+        _os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _cache)
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── Suppress console windows for ALL child processes on Windows ───────────────
 # Prevents Playwright/Chromium subprocess flashes when optimizer runs
 if _sys.platform == "win32":
@@ -110,8 +123,8 @@ class DarkThroneApp:
     def __init__(self, root):
         self.root = root
         self.root.title("DarkThrone Suite")
-        self.root.geometry("980x640")
-        self.root.minsize(760, 480)
+        self.root.geometry("980x720")
+        self.root.minsize(900, 520)
         self.root.configure(bg=C["bg"])
 
         self._cfg        = self._load_config()
@@ -195,10 +208,46 @@ class DarkThroneApp:
         body = tk.Frame(self.root, bg=C["bg"])
         body.pack(fill="both", expand=True, padx=18, pady=14)
 
-        # ── Sidebar
-        sb = tk.Frame(body, bg=C["bg"], width=210)
-        sb.pack(side="left", fill="y", padx=(0, 14))
-        sb.pack_propagate(False)
+        # ── Scrollable sidebar ───────────────────────────────────────────
+        # The sidebar has more content than a 720px window can show on
+        # short laptop screens, so wrap it in a Canvas + Scrollbar.  The
+        # inner `sb` frame is what every _section / _button / etc. packs
+        # into, exactly as before — the scroll rig is transparent.
+        sb_outer = tk.Frame(body, bg=C["bg"], width=226)
+        sb_outer.pack(side="left", fill="y", padx=(0, 14))
+        sb_outer.pack_propagate(False)
+
+        sb_canvas = tk.Canvas(
+            sb_outer, bg=C["bg"], highlightthickness=0, bd=0, width=210)
+        sb_scroll = tk.Scrollbar(
+            sb_outer, orient="vertical", command=sb_canvas.yview,
+            bg=C["bg"], troughcolor=C["card"], activebackground=C["border"],
+            highlightthickness=0, bd=0, width=10)
+        sb_canvas.configure(yscrollcommand=sb_scroll.set)
+        sb_scroll.pack(side="right", fill="y")
+        sb_canvas.pack(side="left", fill="both", expand=True)
+
+        sb = tk.Frame(sb_canvas, bg=C["bg"])
+        sb_window = sb_canvas.create_window((0, 0), window=sb, anchor="nw")
+
+        def _sb_configure(event=None):
+            sb_canvas.configure(scrollregion=sb_canvas.bbox("all"))
+            # Keep the inner frame width synced to the canvas width so
+            # long labels don't wrap oddly or get clipped horizontally.
+            sb_canvas.itemconfig(sb_window, width=sb_canvas.winfo_width())
+        sb.bind("<Configure>",        _sb_configure)
+        sb_canvas.bind("<Configure>", _sb_configure)
+
+        # Mousewheel only scrolls when the cursor is over the sidebar so
+        # the log widget keeps its own scroll behavior.
+        def _sb_wheel(event):
+            sb_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        def _sb_wheel_bind(e):   sb_canvas.bind_all("<MouseWheel>", _sb_wheel)
+        def _sb_wheel_unbind(e): sb_canvas.unbind_all("<MouseWheel>")
+        sb_canvas.bind("<Enter>", _sb_wheel_bind)
+        sb_canvas.bind("<Leave>", _sb_wheel_unbind)
+        sb.bind("<Enter>",        _sb_wheel_bind)
+        sb.bind("<Leave>",        _sb_wheel_unbind)
 
         # ACCOUNT
         self._section(sb, "ACCOUNT")
