@@ -3119,14 +3119,21 @@ def calibrate_models(profiles: dict, you: dict = None):
     atk_pts, def_pts, spo_pts, spd_pts = [], [], [], []
 
     # Collect points from CONFIRMED_STATS (may be stale)
-    # Rank data: prefer scraped profile (freshest), fall back to CONFIRMED_STATS
-    # rank field (user-entered when rank is known, e.g. off_rank=1 for server #1).
+    # Rank priority: CONFIRMED_STATS rank wins when explicitly set (e.g. off_rank=1
+    # means we verified this player is server rank 1).  Only fall back to scraped
+    # profile rank when CONFIRMED_STATS does NOT have a rank for that field.
+    # Previously "p.get() or cs.get()" let stale profile ranks override confirmed
+    # ranks (e.g. TGO profile shows rank=2 after being overtaken briefly, causing
+    # the model to anchor at (2, 394k) instead of the confirmed (1, 394k)).
     for cname, cs in CONFIRMED_STATS.items():
         p = profiles.get(cname, {})
-        ar  = p.get('off_rank',     0) or cs.get('off_rank',     0)
-        dr  = p.get('def_rank',     0) or cs.get('def_rank',     0)
-        sor = p.get('spy_off_rank', 0) or cs.get('spy_off_rank', 0)
-        sdr = p.get('spy_def_rank', 0) or cs.get('spy_def_rank', 0)
+        def _rank(field):
+            cs_r = cs.get(field, 0)
+            return cs_r if cs_r > 0 else p.get(field, 0)
+        ar  = _rank('off_rank')
+        dr  = _rank('def_rank')
+        sor = _rank('spy_off_rank')
+        sdr = _rank('spy_def_rank')
         if ar  > 0 and cs.get('atk',     0): atk_pts.append((ar,  cs['atk']))
         if dr  > 0 and cs.get('def',     0): def_pts.append((dr,  cs['def']))
         if sor > 0 and cs.get('spy_off', 0): spo_pts.append((sor, cs['spy_off']))
@@ -3146,17 +3153,31 @@ def calibrate_models(profiles: dict, you: dict = None):
 
     MAX_K = 0.05   # cap: prevents rank-1 estimates from being absurdly large
 
+    def _set_model(pts, A, k, label):
+        """Cap k at MAX_K and re-anchor A to the best (lowest-rank) point so that
+        rank_*(best_rank) == best_value after capping.  Without re-anchoring, A
+        stays at the pre-cap fit value which makes rank_atk(1) >> confirmed rank-1."""
+        k_c = min(k, MAX_K)
+        if k > MAX_K and pts:
+            valid = sorted(p for p in pts if p[0] > 0 and p[1] > 0)
+            if valid:
+                r0, v0 = valid[0]   # lowest rank number = highest-ranked player
+                A = v0 / math.exp(-k_c * r0)
+                print(f"     🔧 {label}: k capped {k:.4f}→{k_c:.4f}, "
+                      f"A re-anchored to rank {r0}={v0:,} → A={A:,.0f}")
+        return A, k_c
+
     A, k = _seed_model(atk_pts, ATK_RANK_K, 'ATK model')
-    if A: ATK_RANK_A, ATK_RANK_K = A, min(k, MAX_K)
+    if A: ATK_RANK_A, ATK_RANK_K = _set_model(atk_pts, A, k, 'ATK')
 
     A, k = _seed_model(def_pts, DEF_RANK_K, 'DEF model')
-    if A: DEF_RANK_A, DEF_RANK_K = A, min(k, MAX_K)
+    if A: DEF_RANK_A, DEF_RANK_K = _set_model(def_pts, A, k, 'DEF')
 
     A, k = _seed_model(spo_pts, ATK_RANK_K, 'SpyOff model')
-    if A: SPY_OFF_RANK_A, SPY_OFF_RANK_K = A, min(k, MAX_K)
+    if A: SPY_OFF_RANK_A, SPY_OFF_RANK_K = _set_model(spo_pts, A, k, 'SpyOff')
 
     A, k = _seed_model(spd_pts, DEF_RANK_K, 'SpyDef model')
-    if A: SPY_DEF_RANK_A, SPY_DEF_RANK_K = A, min(k, MAX_K)
+    if A: SPY_DEF_RANK_A, SPY_DEF_RANK_K = _set_model(spd_pts, A, k, 'SpyDef')
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def read_csv(path):
