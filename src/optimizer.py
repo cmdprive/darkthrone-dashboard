@@ -2161,8 +2161,16 @@ def scrape_spy_candidates(page, max_pages: int = 5) -> list:
     need a dedicated scraper.  Without this, spy mode would try to spy
     targets that aren't on the /game/spy page and get form_not_found
     forever.
+
+    The spy page's pagination is broken: requesting ?page=N beyond the
+    last page silently returns page 1 again, so we'd capture every player
+    twice (or more) if max_pages is larger than the real page count.
+    We dedupe by player_id via a seen-set AND break on a fingerprint
+    match (same as scrape_attack_candidates).
     """
     rows_out = []
+    seen_pids = set()
+    last_fp = ""
     for page_num in range(1, max_pages + 1):
         url = f"{BASE_URL}/spy" + (f"?page={page_num}" if page_num > 1 else "")
         try:
@@ -2215,9 +2223,21 @@ def scrape_spy_candidates(page, max_pages: int = 5) -> list:
             break
         if not batch:
             break
+        # Fingerprint: if this page returns the same pids as the previous
+        # page, pagination has wrapped back to page 1 — stop scraping.
+        fp = ",".join(str(e["pid"]) for e in batch)
+        if fp == last_fp:
+            break
+        last_fp = fp
+        added_this_page = 0
         for e in batch:
+            pid = str(e["pid"])
+            if pid in seen_pids:
+                continue  # defensive: skip any intra-batch duplicates
+            seen_pids.add(pid)
+            added_this_page += 1
             rows_out.append({
-                "player_id":    str(e["pid"]),
+                "player_id":    pid,
                 "name":         e["name"],
                 "level":        e["level"],
                 "race":         e["race"],
@@ -2236,6 +2256,9 @@ def scrape_spy_candidates(page, max_pages: int = 5) -> list:
                 "attack_count": int(e["spy_count"]),
                 "list_page":    page_num,
             })
+        # If nothing new was added this page, stop — we've saturated the pool.
+        if added_this_page == 0:
+            break
     return rows_out
 
 
@@ -3038,6 +3061,13 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
                             raise BattleStop("user", "stop requested")
                         if actions >= max_total:
                             raise BattleStop("user", "max_total reached")
+
+                        # Defensive: if a target was marked exhausted earlier
+                        # this session (form_not_found, moved, etc.), don't
+                        # retry it — the scraper may still return duplicates
+                        # or a lingering cached row.
+                        if str(tgt.get("player_id")) in session_exhausted:
+                            continue
 
                         # Re-check live header so we don't run out mid-loop.
                         hdr = read_live_header(page)
