@@ -3317,6 +3317,11 @@ CONFIRMED_STATS = {
         'atk': 19_145, 'def': 14_423, 'spy_off': 210,   'spy_def':  90,
         'gold':    782, 'bank': 1_010_000, 'citizens_idle': 1_385,
     },
+    # verified from dashboard row 2026-04-15 (Fort HP 3000/3000 = Fort Lv2)
+    'TGO Jasbob1989': {
+        'level': 29, 'race': 'Undead', 'cls': 'Fighter',
+        'atk': 394_000, 'def': 120_000,
+    },
     # def_rank=1 on server — verified from profile screenshot 2026-04-08
     'Radagon Of The Golden Order': {
         'level': 18, 'race': 'Goblin', 'cls': 'Cleric',
@@ -3335,7 +3340,7 @@ CONFIRMED_STATS = {
 # Format: (name, level, race, class, population, clan, overall_rank, off_rank, def_rank)
 PLAYERS = [
     ('Ashcipher',                  19,'Human',  'Fighter', 2760,'RQUM', 99, 99, 99),
-    ('TGO Jasbob1989',             19,'Undead', 'Fighter', 2757,'TGO',  99, 99, 99),
+    ('TGO Jasbob1989',             29,'Undead', 'Fighter', 2757,'TGO',  99, 99, 99),
     ('Nerv',                       20,'Human',  'Fighter', 2754,'TGO',  99, 99, 99),
     ('Radagon Of The Golden Order',18,'Goblin', 'Cleric',  2600,'TGO',  99, 99, 99),
     ('sirclement_xxviii',          18,'Undead', 'Assassin',2647,'—',    99, 99, 99),
