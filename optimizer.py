@@ -3404,11 +3404,17 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
         cal_def = rank_def(def_rank) if def_rank < 900 else 0
         cal_so  = rank_spy_off(s_off) if s_off < 900 else 0
         cal_sd  = rank_spy_def(s_def) if s_def < 900 else 0
-        # Use the higher of confirmed (may be stale) vs model (anchored to current server)
-        atk_v = max(c.get('atk',     0), cal_atk)
-        def_v = max(c.get('def',     0), cal_def)
-        spo_v = max(c.get('spy_off', 0), cal_so)
-        spd_v = max(c.get('spy_def', 0), cal_sd)
+        # Confirmed stats are authoritative — always use them when present.
+        # Model fills in ONLY if the confirmed field is absent/zero.
+        # (max() was tried here but caused the model to override fresh confirmed
+        # data, e.g. showing 527k ATK when the real value is 394k.)
+        # Stale confirmed data (e.g. Radagon April-8 DEF) is acceptable because
+        # rank_snap now estimates all 259 server players, so even if a confirmed
+        # player's value is stale the server-rank ordering is still correct.
+        atk_v = c.get('atk',     0) or cal_atk
+        def_v = c.get('def',     0) or cal_def
+        spo_v = c.get('spy_off', 0) or cal_so
+        spd_v = c.get('spy_def', 0) or cal_sd
         # Population ceiling: a player CANNOT have more stat than their ENTIRE
         # population fully equipped.  Caps unrealistic model outliers.
         gt = max_gear_tier(level);  ut = max_unit_tier(level)
@@ -3416,7 +3422,7 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
         max_def_pu = UNIT_DEF[ut] + WEAPON_STATS[gt] + ARMOR_STATS[gt]
         atk_v = min(atk_v, int(pop * max_atk_pu * 1.10))
         def_v = min(def_v, int(pop * max_def_pu * 1.10))
-        conf  = 'CFM+MODEL' if (cal_atk or cal_def) else 'CONFIRMED'
+        conf  = 'CONFIRMED'
         return {
             'pop':       pop,     'workers':   workers,
             'off_u':     '?',     'def_u':     '?',
