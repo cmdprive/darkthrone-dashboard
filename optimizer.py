@@ -3119,12 +3119,14 @@ def calibrate_models(profiles: dict, you: dict = None):
     atk_pts, def_pts, spo_pts, spd_pts = [], [], [], []
 
     # Collect points from CONFIRMED_STATS (may be stale)
+    # Rank data: prefer scraped profile (freshest), fall back to CONFIRMED_STATS
+    # rank field (user-entered when rank is known, e.g. off_rank=1 for server #1).
     for cname, cs in CONFIRMED_STATS.items():
         p = profiles.get(cname, {})
-        ar  = p.get('off_rank',     0)
-        dr  = p.get('def_rank',     0)
-        sor = p.get('spy_off_rank', 0)
-        sdr = p.get('spy_def_rank', 0)
+        ar  = p.get('off_rank',     0) or cs.get('off_rank',     0)
+        dr  = p.get('def_rank',     0) or cs.get('def_rank',     0)
+        sor = p.get('spy_off_rank', 0) or cs.get('spy_off_rank', 0)
+        sdr = p.get('spy_def_rank', 0) or cs.get('spy_def_rank', 0)
         if ar  > 0 and cs.get('atk',     0): atk_pts.append((ar,  cs['atk']))
         if dr  > 0 and cs.get('def',     0): def_pts.append((dr,  cs['def']))
         if sor > 0 and cs.get('spy_off', 0): spo_pts.append((sor, cs['spy_off']))
@@ -3318,9 +3320,10 @@ CONFIRMED_STATS = {
         'gold':    782, 'bank': 1_010_000, 'citizens_idle': 1_385,
     },
     # verified from dashboard row 2026-04-15 (Fort HP 3000/3000 = Fort Lv2)
+    # off_rank=1 confirmed: server rank #1 offense — sets the ATK model ceiling
     'TGO Jasbob1989': {
         'level': 29, 'race': 'Undead', 'cls': 'Fighter',
-        'atk': 394_000, 'def': 120_000,
+        'atk': 394_000, 'def': 120_000, 'off_rank': 1,
     },
     # def_rank=1 on server — verified from profile screenshot 2026-04-08
     'Radagon Of The Golden Order': {
@@ -3546,6 +3549,16 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
     def_    = cal_def     or formula_def
     spy_off = cal_spy_off or formula_spy_off
     spy_def = cal_spy_def or formula_spy_def
+
+    # ── Server rank-1 ceiling ──────────────────────────────────────────────────
+    # No unconfirmed player can have more ATK/DEF than the server rank-1 player.
+    # rank_atk(1) / rank_def(1) are anchored to confirmed rank-1 stats, so they
+    # represent the true server maximum.  This prevents formula/model over-shoots
+    # for players whose formula produces an implausibly high value.
+    if ATK_RANK_A > 0:
+        atk = min(atk, rank_atk(1))
+    if DEF_RANK_A > 0:
+        def_ = min(def_, rank_def(1))
 
     # ── Population ceiling ─────────────────────────────────────────────────────
     # A player CANNOT have more ATK/DEF than their ENTIRE population, fully
