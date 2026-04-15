@@ -2007,33 +2007,51 @@ def _battle_log_row(mode, player_id, name, turns, gold_before, gold_after, xp, r
 # ── Estimates lookup (for target DEF) ────────────────────────────────────────
 def load_estimates_lookup() -> dict:
     """Return {Player name (str): {est_atk, est_def, est_spy_off, est_spy_def}}.
-    Reads private_player_estimates.csv as written by estimator_run().  The
-    CSV keys by Player NAME — there's no PlayerID column — so the battle loop
-    joins on the `name` field of each scraped row.  Missing file or columns
-    → empty dict (battle loop will treat every target as 'unknown' and skip it,
-    which is the safe default)."""
+    Reads private_player_estimates.csv (written by estimator_run()) and
+    overlays it with private_intel.csv (written after each attack/spy).
+    Intel values WIN when present because they are ground truth from actual
+    reports, and we also apply them as floors — a confirmed DEF can only
+    have grown since the observation, so max(intel, estimator) is the best
+    current estimate."""
     path = "private_player_estimates.csv"
-    if not os.path.isfile(path):
-        return {}
     lookup = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    name = (row.get("Player") or row.get("Name") or "").strip()
+                    if not name:
+                        continue
+                    clean = name.replace(" (YOU)", "").strip()
+                    lookup[clean] = {
+                        "name":         clean,
+                        "est_atk":      num(row.get("EstATK",    row.get("est_atk",     0))),
+                        "est_def":      num(row.get("EstDEF",    row.get("est_def",     0))),
+                        "est_spy_off":  num(row.get("EstSpyOff", row.get("est_spy_off", 0))),
+                        "est_spy_def":  num(row.get("EstSpyDef", row.get("est_spy_def", 0))),
+                        "confidence":   (row.get("Confidence",   "") or "").strip(),
+                    }
+        except Exception as e:
+            print(f"  ⚠️  load_estimates_lookup failed: {e}")
+
+    # Overlay with private_intel.csv — max(intel_floor, estimator_value) so
+    # confirmed observations raise the bar without ever lowering it.
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                name = (row.get("Player") or row.get("Name") or "").strip()
-                if not name:
-                    continue
-                # Normalise: strip any (YOU) marker so the attack-list join matches.
-                clean = name.replace(" (YOU)", "").strip()
-                lookup[clean] = {
-                    "name":         clean,
-                    "est_atk":      num(row.get("EstATK",    row.get("est_atk",     0))),
-                    "est_def":      num(row.get("EstDEF",    row.get("est_def",     0))),
-                    "est_spy_off":  num(row.get("EstSpyOff", row.get("est_spy_off", 0))),
-                    "est_spy_def":  num(row.get("EstSpyDef", row.get("est_spy_def", 0))),
-                    "confidence":   (row.get("Confidence",   "") or "").strip(),
-                }
+        for name, intel in load_intel_overlay().items():
+            cur = lookup.get(name, {
+                "name": name, "est_atk": 0, "est_def": 0,
+                "est_spy_off": 0, "est_spy_def": 0, "confidence": "INTEL",
+            })
+            cur["est_atk"]     = max(cur.get("est_atk",     0), int(intel.get("atk",     0)))
+            cur["est_def"]     = max(cur.get("est_def",     0), int(intel.get("def",     0)))
+            cur["est_spy_off"] = max(cur.get("est_spy_off", 0), int(intel.get("spy_off", 0)))
+            cur["est_spy_def"] = max(cur.get("est_spy_def", 0), int(intel.get("spy_def", 0)))
+            if intel.get("atk") or intel.get("def") or intel.get("spy_off") or intel.get("spy_def"):
+                cur["confidence"] = "INTEL"
+            lookup[name] = cur
     except Exception as e:
-        print(f"  ⚠️  load_estimates_lookup failed: {e}")
+        print(f"  ⚠️  intel overlay failed: {e}")
+
     return lookup
 
 
@@ -2136,6 +2154,91 @@ def scrape_attack_candidates(page, max_pages: int = 20) -> list:
     return rows_out
 
 
+def scrape_spy_candidates(page, max_pages: int = 5) -> list:
+    """Paginate /game/spy and return one dict per spy-able target row.
+    The spy page is structurally different from the attack list — it has
+    only name / level / race columns plus recon+sabotage forms — so we
+    need a dedicated scraper.  Without this, spy mode would try to spy
+    targets that aren't on the /game/spy page and get form_not_found
+    forever.
+    """
+    rows_out = []
+    for page_num in range(1, max_pages + 1):
+        url = f"{BASE_URL}/spy" + (f"?page={page_num}" if page_num > 1 else "")
+        try:
+            page.goto(url)
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            break
+        # Use page.evaluate to pull every (pid, name, level, race, count, disabled)
+        # in one round-trip — much faster than query_selector per row.
+        js = r"""
+          () => {
+            const out = [];
+            document.querySelectorAll('table tbody tr').forEach(tr => {
+              const disabled = (tr.className || '').includes('disabled');
+              const link = tr.querySelector('a.player-link');
+              if (!link) return;
+              // Name: direct text nodes only, excluding avatar/badge spans
+              const name = Array.from(link.childNodes)
+                .filter(n => n.nodeType === 3)
+                .map(n => n.textContent.trim())
+                .filter(Boolean)
+                .join(' ')
+                .trim();
+              const href = link.getAttribute('href') || '';
+              const idm  = href.match(/\/player\/(\d+)/);
+              const pid  = idm ? parseInt(idm[1]) : 0;
+              const tds  = tr.querySelectorAll('td');
+              const level = tds[1] ? parseInt((tds[1].innerText || '').trim()) : 0;
+              const race  = tds[2] ? (tds[2].innerText || '').trim()           : '';
+              // Recon button carries the daily counter: "1/5 today"
+              const reconBtn = tr.querySelector(
+                'form[action*="/spy/"] button[title*="today"]');
+              let spy_count = 0;
+              if (reconBtn) {
+                const tm = (reconBtn.getAttribute('title') || '').match(/(\d+)\s*\/\s*5/);
+                if (tm) spy_count = parseInt(tm[1]);
+              }
+              const hasForm = !!tr.querySelector(
+                'form[action*="/spy/"][class*="inline"]');
+              if (name && pid && hasForm && !disabled) {
+                out.push({pid, name, level, race, spy_count});
+              }
+            });
+            return out;
+          }
+        """
+        try:
+            batch = page.evaluate(js)
+        except Exception:
+            break
+        if not batch:
+            break
+        for e in batch:
+            rows_out.append({
+                "player_id":    str(e["pid"]),
+                "name":         e["name"],
+                "level":        e["level"],
+                "race":         e["race"],
+                # Spy page has no gold / fort / in_range data — fill sensible defaults
+                "gold":         0,
+                "fort_pct":     0,
+                "fort_hp":      0,
+                "fort_max":     0,
+                "in_range":     True,
+                "is_bot":       "[bot]" in e["name"].lower(),
+                "is_clan":      False,
+                "is_friend":    False,
+                "is_hitlist":   False,
+                # Re-use the attack_count field name so pick_battle_targets
+                # can apply the same <5 filter without branching.
+                "attack_count": int(e["spy_count"]),
+                "list_page":    page_num,
+            })
+    return rows_out
+
+
 def read_reset_countdown(page) -> int:
     """Return seconds until the daily attack counter resets, or 0 if unknown.
     The attack page embeds <span id='attackResetTimer' data-seconds='7986'>2h 13m</span>."""
@@ -2216,6 +2319,33 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
 
 
 # ── Action executors ─────────────────────────────────────────────────────────
+def _wait_post_submit(page, old_url: str, url_hint: str = "") -> None:
+    """After form.submit() the navigation kicks off asynchronously and
+    Playwright's wait_for_load_state('networkidle') can return while the
+    OLD page is still displayed.  This helper:
+      1. waits for the URL to change (up to 15s)
+      2. waits for domcontentloaded on the new page
+      3. waits for networkidle
+      4. short sleep so animated banners finish rendering
+    """
+    try:
+        page.wait_for_url(
+            lambda u: u != old_url and (url_hint in u if url_hint else True),
+            timeout=15000,
+        )
+    except Exception:
+        pass
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    time.sleep(0.8)
+
+
 def _submit_attack_form(page, player_id: str, turns: int) -> dict:
     """Submit the hidden <form id='attack-form-{id}'> via page.evaluate.
     Sets the turns input value, dispatches input/change events (so any JS
@@ -2290,10 +2420,7 @@ def _parse_battle_result(page) -> dict:
     if "/login" in url:
         raise BattleStop("session", "redirected to login")
 
-    try:
-        body = (page.inner_text("body") or "")
-    except Exception:
-        body = ""
+    body = _page_text(page)   # content()+strip, more reliable than inner_text()
 
     def has(pattern: str) -> bool:
         return re.search(pattern, body, re.IGNORECASE) is not None
@@ -2341,6 +2468,297 @@ def _parse_battle_result(page) -> dict:
     return {"result": "unknown"}
 
 
+# ── Intelligence harvesting (learn from battle + spy reports) ──────────────
+#
+# Every successful attack or recon spy surfaces the target's actual stats on
+# the response page.  We parse those out and append them to private_intel.csv
+# so the estimator can use fresh, confirmed values on the next calibration
+# pass.  The overlay is read in three places:
+#   - load_estimates_lookup() merges intel rows so pick_battle_targets sees
+#     the latest defense when picking who to hit next
+#   - calibrate_models() merges intel rows into CONFIRMED_STATS so the rank
+#     model anchors on fresh data
+#   - estimate() treats intel as a floor (same as hardcoded confirmed stats)
+
+INTEL_FILE = "private_intel.csv"
+INTEL_COLUMNS = [
+    "Timestamp", "Source", "Player", "Level", "Race", "Class",
+    "ATK", "DEF", "SpyOff", "SpyDef",
+    "Gold", "Bank", "Citizens",
+    "Workers", "Soldiers", "Guards", "Spies", "Sentries",
+    "FortHP", "FortMax", "Notes",
+]
+
+def _page_text(page) -> str:
+    """Return the page body text, flattened for regex matching.
+
+    We use page.content() + manual tag stripping rather than
+    page.inner_text("body") because inner_text respects CSS visibility
+    and SKIPS elements with display:none / opacity:0 / visibility:hidden.
+    The spy report page renders its 'Operation Successful' banner and
+    stats block inside an animated container that Playwright's
+    inner_text misses at the moment we read the page — content() gets
+    them because they're in the DOM even if not yet painted.
+    """
+    try:
+        html = page.content() or ""
+    except Exception:
+        return ""
+    html = re.sub(r"<script[\s\S]*?</script>", " ", html)
+    html = re.sub(r"<style[\s\S]*?</style>",   " ", html)
+    html = re.sub(r"<[^>]+>", " ", html)
+    html = html.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    html = html.replace("&nbsp;", " ")
+    return re.sub(r"\s+", " ", html).strip()
+
+
+def _parse_kmb(s: str) -> int:
+    """Parse '1.62M', '3.4K', '1,234,567', or '12345' into an int.
+    Used for spy report numbers that sometimes use the short suffix form."""
+    if s is None:
+        return 0
+    t = str(s).strip().replace(",", "")
+    m = re.match(r"^([\d.]+)\s*([KkMmBb]?)$", t)
+    if not m:
+        # plain integer fallback
+        try:    return int(re.sub(r"\D", "", t) or 0)
+        except Exception: return 0
+    mag = {"": 1, "K": 1_000, "k": 1_000,
+           "M": 1_000_000, "m": 1_000_000,
+           "B": 1_000_000_000, "b": 1_000_000_000}
+    try:
+        return int(float(m.group(1)) * mag.get(m.group(2), 1))
+    except Exception:
+        return 0
+
+
+def parse_attack_report(page) -> dict:
+    """Parse a /game/attack/log/{id} battle-report page.
+    Returns dict with target_name / target_level / target_race / target_class
+    / target_def (from 'Final Defense N') / xp_gained / gold_stolen / result.
+    Missing fields default to 0 / '' so the caller can feed the dict straight
+    into record_intel() without extra guards."""
+    text = _page_text(page)
+    out = {"source": "attack"}
+
+    if re.search(r"\bVICTORY\b", text):
+        out["result"] = "win"
+    elif re.search(r"\bDEFEAT\b", text):
+        out["result"] = "loss"
+    else:
+        out["result"] = "unknown"
+
+    # "You attacked <Name> (Level N)" — name may contain spaces/brackets
+    m = re.search(r"You\s+attacked\s+(.+?)\s*\(Level\s+(\d+)\)", text)
+    if m:
+        out["target_name"]  = m.group(1).strip()
+        out["target_level"] = int(m.group(2))
+
+    # "VS <Name> <Race> <Class> - Lv.N  <def_value> Defense"
+    # Cross-reference to populate race/class if we already have a name.
+    if out.get("target_name"):
+        name_pat = re.escape(out["target_name"])
+        m = re.search(
+            rf"{name_pat}\s+(\w+)\s+(\w+)\s*-\s*Lv\.(\d+)\s+([\d,]+)\s*Defense",
+            text
+        )
+        if m:
+            out["target_race"]  = m.group(1)
+            out["target_class"] = m.group(2)
+            # Prefer the parenthetical "(Level N)" above but accept this too
+            out.setdefault("target_level", int(m.group(3)))
+
+    # "Final Defense N" — the authoritative post-calc defense we defeated
+    m = re.search(r"Final\s+Defense\s+([\d,]+)", text)
+    if m:
+        out["target_def"] = num(m.group(1))
+
+    # "+N Gold Stolen" / "+N Experience"
+    m = re.search(r"\+\s*([\d,]+)\s*Gold\s+Stolen", text, re.I)
+    if m: out["gold_stolen"] = num(m.group(1))
+    m = re.search(r"\+\s*([\d,]+)\s*Experience", text, re.I)
+    if m: out["xp_gained"] = num(m.group(1))
+
+    return out
+
+
+def parse_spy_report(page) -> dict:
+    """Parse a /game/spy/log/{id} intelligence-report page.  Returns dict
+    with target_name / target_level / target_race / target_class / target_atk
+    / target_def / target_spy_off / target_spy_def / target_gold / target_bank
+    / target_citizens / target_fort_hp / target_fort_max / xp_gained /
+    army unit counts / result."""
+    text = _page_text(page)
+    out = {"source": "spy"}
+
+    if "Operation Successful" in text or "Intel gathered successfully" in text:
+        out["result"] = "spy_ok"
+    elif re.search(r"(operation|spy|recon)\s+(failed|unsuccessful)|caught|detected|alerted", text, re.I):
+        out["result"] = "spy_fail"
+    else:
+        out["result"] = "unknown"
+
+    if out["result"] != "spy_ok":
+        return out   # failed / unknown spies don't reveal the stat block
+
+    # "Intel gathered successfully - <Name> !"
+    m = re.search(r"Intel\s+gathered\s+successfully\s*-\s*(.+?)\s*[!\?]", text)
+    if m:
+        out["target_name"] = m.group(1).strip()
+
+    # "Experience +N XP"
+    m = re.search(r"Experience\s+\+\s*([\d,]+)\s*XP", text)
+    if m: out["xp_gained"] = num(m.group(1))
+
+    # "Level N  Race <R>  Class <C>"
+    m = re.search(r"Level\s+(\d+)\s+Race\s+(\w+)\s+Class\s+(\w+)", text)
+    if m:
+        out["target_level"] = int(m.group(1))
+        out["target_race"]  = m.group(2)
+        out["target_class"] = m.group(3)
+
+    # "Fort HP N / M"
+    m = re.search(r"Fort\s+HP\s+([\d,]+)\s*/\s*([\d,]+)", text)
+    if m:
+        out["target_fort_hp"]  = num(m.group(1))
+        out["target_fort_max"] = num(m.group(2))
+
+    # The 4 combat stats appear as a contiguous block:
+    #   "Total Offense N  Total Defense N  Spy Offense N  Spy Defense N"
+    # Match the whole block in one pattern so we don't collide with the
+    # army section where "Spy Offense" is a column label for unit counts.
+    m = re.search(
+        r"Total\s+Offense\s+([\d,]+)\s+"
+        r"Total\s+Defense\s+([\d,]+)\s+"
+        r"Spy\s+Offense\s+([\d,]+)\s+"
+        r"Spy\s+Defense\s+([\d,]+)",
+        text
+    )
+    if m:
+        out["target_atk"]     = num(m.group(1))
+        out["target_def"]     = num(m.group(2))
+        out["target_spy_off"] = num(m.group(3))
+        out["target_spy_def"] = num(m.group(4))
+
+    # Resources — both gold values can use the K/M/B short form.
+    m = re.search(r"Gold\s+on\s+Hand\s+([\d\.,]+\s*[KkMmBb]?)", text)
+    if m: out["target_gold"] = _parse_kmb(m.group(1))
+    m = re.search(r"Gold\s+in\s+Bank\s+([\d\.,]+\s*[KkMmBb]?)", text)
+    if m: out["target_bank"] = _parse_kmb(m.group(1))
+    m = re.search(r"Citizens\s+([\d,]+)", text)
+    if m: out["target_citizens"] = num(m.group(1))
+
+    # Army composition.  "Spy Offense" / "Spy Defense" as role labels COLLIDE
+    # with the same strings used in the stats block, so we slice the text at
+    # "Army Composition" and only look in the second half.  Every army row
+    # has the pattern "Tn <UnitName> <Role> <Count> ..." where <Count> is
+    # the first number immediately after the role label.
+    army_text = text
+    idx = text.find("Army Composition")
+    if idx >= 0:
+        # Cut off at the next section ("Armory Inventory" / "Buildings" / etc.)
+        tail = text[idx:]
+        for stop in ("Armory Inventory", "Buildings", "Share this intel"):
+            s = tail.find(stop)
+            if s > 0:
+                tail = tail[:s]
+                break
+        army_text = tail
+    for role, key in [
+        ("Workers",            "target_workers"),
+        ("Offensive Military", "target_soldiers"),
+        ("Defensive Military", "target_guards"),
+        ("Spy Offense",        "target_spies"),
+        ("Spy Defense",        "target_sentries"),
+    ]:
+        m = re.search(rf"{re.escape(role)}\s+([\d,]+)", army_text)
+        if m:
+            out[key] = num(m.group(1))
+
+    return out
+
+
+def record_intel(entry: dict, log_fn=None) -> None:
+    """Append one row to private_intel.csv from a parse_*_report() dict.
+    Silently no-ops if there's no target_name (parser failed)."""
+    if not entry.get("target_name"):
+        return
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = [
+        ts,
+        entry.get("source", ""),
+        entry.get("target_name", ""),
+        entry.get("target_level",    ""),
+        entry.get("target_race",     ""),
+        entry.get("target_class",    ""),
+        entry.get("target_atk",      ""),
+        entry.get("target_def",      ""),
+        entry.get("target_spy_off",  ""),
+        entry.get("target_spy_def",  ""),
+        entry.get("target_gold",     ""),
+        entry.get("target_bank",     ""),
+        entry.get("target_citizens", ""),
+        entry.get("target_workers",  ""),
+        entry.get("target_soldiers", ""),
+        entry.get("target_guards",   ""),
+        entry.get("target_spies",    ""),
+        entry.get("target_sentries", ""),
+        entry.get("target_fort_hp",  ""),
+        entry.get("target_fort_max", ""),
+        entry.get("notes", ""),
+    ]
+    _unhide(INTEL_FILE)
+    new = not os.path.isfile(INTEL_FILE)
+    with open(INTEL_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(INTEL_COLUMNS)
+        w.writerow(row)
+    if log_fn:
+        src  = entry.get("source", "?")
+        name = entry.get("target_name", "?")
+        bits = []
+        # Use 'in entry' (not truthy) so 0 def is counted as data, not "nothing".
+        if "target_def"     in entry: bits.append(f"def={int(entry['target_def']):,}")
+        if "target_atk"     in entry: bits.append(f"atk={int(entry['target_atk']):,}")
+        if "target_spy_off" in entry: bits.append(f"spy_off={int(entry['target_spy_off']):,}")
+        if "target_spy_def" in entry: bits.append(f"spy_def={int(entry['target_spy_def']):,}")
+        detail = "  ".join(bits) if bits else "no numbers"
+        log_fn(f"  🛰  intel({src}) {name}: {detail}", "dim")
+
+
+def load_intel_overlay() -> dict:
+    """Read private_intel.csv and return {Player name: latest_stats}.
+    Latest row per player wins (by timestamp order in the file — append-only)."""
+    path = INTEL_FILE
+    if not os.path.isfile(path):
+        return {}
+    overlay = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                name = (row.get("Player") or "").strip()
+                if not name:
+                    continue
+                overlay[name] = {
+                    "level":    num(row.get("Level",    0)),
+                    "race":     row.get("Race",  "").strip(),
+                    "cls":      row.get("Class", "").strip(),
+                    "atk":      num(row.get("ATK",    0)),
+                    "def":      num(row.get("DEF",    0)),
+                    "spy_off":  num(row.get("SpyOff", 0)),
+                    "spy_def":  num(row.get("SpyDef", 0)),
+                    "gold":     num(row.get("Gold",   0)),
+                    "bank":     num(row.get("Bank",   0)),
+                    "citizens": num(row.get("Citizens", 0)),
+                    "source":   row.get("Source", "").strip(),
+                    "timestamp":row.get("Timestamp", "").strip(),
+                }
+    except Exception as e:
+        print(f"  ⚠️  load_intel_overlay failed: {e}")
+    return overlay
+
+
 def do_attack(page, target: dict, turns: int, log_fn, dry_run: bool = False) -> dict:
     """Attack target with N turns.  Returns the parse_battle_result dict."""
     pid       = str(target["player_id"])
@@ -2363,6 +2781,7 @@ def do_attack(page, target: dict, turns: int, log_fn, dry_run: bool = False) -> 
         log_fn(f"  [DRY] ⚔  would attack {name} (pid={pid}) with {turns} turns  (ratio {target.get('atk_ratio',0):.2f}×)", "dim")
         return {"result": "dry_run", "xp": 0, "gold_gained": 0}
 
+    old_url = page.url
     sub = _submit_attack_form(page, pid, turns)
     if not sub.get("ok"):
         err = sub.get("err", "unknown")
@@ -2370,21 +2789,35 @@ def do_attack(page, target: dict, turns: int, log_fn, dry_run: bool = False) -> 
         _battle_log_row("attack", pid, name, turns, gold_before, gold_before,
                         0, f"skipped_{err}")
         return {"result": "skipped", "xp": 0, "gold_gained": 0, "err": err}
+    # Wait for the real battle-report page to land before parsing.
+    _wait_post_submit(page, old_url, url_hint="/attack/log/")
+    res = _parse_battle_result(page)
+    # Always dump the LAST attack response for diagnosis — overwrites each
+    # time, so the file only holds the most recent response.
     try:
-        page.wait_for_load_state("networkidle", timeout=20000)
+        _unhide("debug_last_attack_response.html")
+        with open("debug_last_attack_response.html", "w", encoding="utf-8") as f:
+            f.write(f"<!-- URL: {page.url} -->\n")
+            f.write(f"<!-- target: {name} pid={pid} -->\n")
+            f.write(f"<!-- battle_result: {res} -->\n")
+            f.write(page.content() or "")
     except Exception:
         pass
-    res = _parse_battle_result(page)
-    # On 'unknown' results, dump the response so we can diagnose what the
-    # server actually returned.  Kept to the latest response only (overwrite).
-    if res.get("result") == "unknown":
-        try:
-            _unhide("debug_battle_response.html")
-            with open("debug_battle_response.html", "w", encoding="utf-8") as f:
-                f.write(f"<!-- URL: {page.url} -->\n")
-                f.write(page.content() or "")
-        except Exception:
-            pass
+
+    # Harvest intel from the battle report page — even on loss the "Final
+    # Defense N" value tells us a floor we can feed back into the model.
+    try:
+        intel = parse_attack_report(page)
+        # Prefer the server-side name from the report if parsed, otherwise
+        # fall back to the scraped row's name so we always log something.
+        intel.setdefault("target_name", name)
+        # Overlay the server-reported gold/xp onto res so the audit row agrees.
+        if intel.get("gold_stolen"): res.setdefault("gold_gained", intel["gold_stolen"])
+        if intel.get("xp_gained"):   res["xp"] = intel["xp_gained"]
+        record_intel(intel, log_fn=log_fn)
+    except Exception as e:
+        log_fn(f"  ⚠️  intel parse failed for {name}: {e}", "dim")
+
     # On error pages the header selectors may not match → 0.  Fall back to
     # gold_before so the audit log is meaningful instead of "went to zero".
     post_hdr = read_live_header(page)
@@ -2419,13 +2852,16 @@ def do_spy(page, target: dict, log_fn, dry_run: bool = False) -> dict:
         log_fn(f"  [DRY] 🔍 would spy {name} (pid={pid})  (ratio {target.get('spy_ratio',0):.2f}×)", "dim")
         return {"result": "dry_run", "xp": 0, "gold_gained": 0}
 
-    # Navigate to the intelligence page first — the spy forms live there.
+    # Navigate to the spy/intelligence page first — the spy forms live there.
+    # The game's actual URL is /game/spy (the old /game/intelligence was a
+    # stale guess that returns 404 now).
     try:
-        page.goto(f"{BASE_URL}/intelligence")
+        page.goto(f"{BASE_URL}/spy")
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
 
+    old_url = page.url
     sub = _submit_spy_form(page, pid)
     if not sub.get("ok"):
         err = sub.get("err", "unknown")
@@ -2433,11 +2869,32 @@ def do_spy(page, target: dict, log_fn, dry_run: bool = False) -> dict:
         _battle_log_row("spy", pid, name, SPY_TURNS_COST, gold_before, gold_before,
                         0, f"skipped_{err}")
         return {"result": "skipped", "xp": 0, "gold_gained": 0, "err": err}
+    # Wait for the real spy-log page to land before parsing.
+    _wait_post_submit(page, old_url, url_hint="/spy/log/")
+    res = _parse_battle_result(page)
+
+    # Always dump the LAST spy response to disk for diagnosis — overwrites
+    # each time, so the file only holds the most recent.
     try:
-        page.wait_for_load_state("networkidle", timeout=20000)
+        _unhide("debug_last_spy_response.html")
+        with open("debug_last_spy_response.html", "w", encoding="utf-8") as f:
+            f.write(f"<!-- URL: {page.url} -->\n")
+            f.write(f"<!-- target: {name} pid={pid} -->\n")
+            f.write(f"<!-- battle_result: {res} -->\n")
+            f.write(page.content() or "")
     except Exception:
         pass
-    res = _parse_battle_result(page)
+
+    # Harvest intel from the spy report — this is the GOLD MINE.  A
+    # successful recon reveals every combat stat and unit count, which we
+    # feed straight back into private_intel.csv for the next calibration.
+    try:
+        intel = parse_spy_report(page)
+        intel.setdefault("target_name", name)
+        record_intel(intel, log_fn=log_fn)
+    except Exception as e:
+        log_fn(f"  ⚠️  intel parse failed for {name}: {e}", "dim")
+
     post_hdr = read_live_header(page)
     gold_after = post_hdr.get("gold", 0) or gold_before
 
@@ -2499,6 +2956,10 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
     losses  = 0
     t0      = time.time()
     reason  = "done"
+    # Session-level exhausted set: once a target refuses to submit
+    # (form_not_found etc.), never try it again this run — otherwise the
+    # re-scrape loop bounces forever on stale candidates.
+    session_exhausted = set()
 
     log_fn(f"⚔  Battle loop starting — mode={mode} margin={cfg.get('margin',1.2)} "
            f"turns/hit={turns_per_hit} dry={dry_run}", "battle")
@@ -2538,8 +2999,16 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
                     if mode == "spy" and our_stats["gold"] < SPY_GOLD_COST:
                         raise BattleStop("gold", "not enough gold for spy")
 
-                    # Fresh scrape for current (N/5) counts + fort%.
-                    rows = scrape_attack_candidates(page, max_pages=int(cfg.get("scrape_pages", 10)))
+                    # Fresh scrape for current (N/5) counts.  Spy mode reads
+                    # /game/spy (a different target pool); attack mode reads
+                    # the attack list.  Mixing them causes form_not_found
+                    # loops because spy forms only exist on /game/spy.
+                    if mode == "spy":
+                        rows = scrape_spy_candidates(page, max_pages=int(cfg.get("scrape_pages", 5)))
+                    else:
+                        rows = scrape_attack_candidates(page, max_pages=int(cfg.get("scrape_pages", 10)))
+                    # Remove anything already permanently exhausted this session.
+                    rows = [r for r in rows if str(r.get("player_id")) not in session_exhausted]
                     estimates = load_estimates_lookup()
                     targets = pick_battle_targets(rows, estimates, our_stats, cfg, mode=mode)
                     if not targets:
@@ -2580,8 +3049,10 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
 
                         r = res.get("result", "unknown")
                         # Skipped targets (form_not_found etc.) don't count as
-                        # "actions" — re-scrape if we get too many in a row.
+                        # "actions" — mark them permanently exhausted for this
+                        # session so we stop trying them on every re-scrape.
                         if r == "skipped":
+                            session_exhausted.add(str(tgt.get("player_id")))
                             consecutive_skips += 1
                             if consecutive_skips >= 3:
                                 log_fn("  🔄 3 consecutive skips — re-scraping", "dim")
@@ -3925,8 +4396,14 @@ def _seed_model(points: list, base_k: float, label: str, your_point=None):
                     has_your = _is_your(p1) or _is_your(p2)
                     candidates.append((has_your, span, A, k, p1, p2))
         if candidates:
-            # Prefer pairs with YOUR anchor, then widest span.
-            candidates.sort(key=lambda c: (not c[0], -c[1]))
+            # Sort by:
+            #   1. has_your (YOUR anchor always wins — it's ground truth)
+            #   2. widest span (wider = less sensitive to adjacent-rank noise)
+            #   3. SMALLEST k (flattest fit — when two points with the same
+            #      span produce different slopes, prefer the flatter one so
+            #      outliers like Thief-class players with near-zero DEF
+            #      don't over-extrapolate the top of the curve)
+            candidates.sort(key=lambda c: (not c[0], -c[1], c[3]))
             has_your, span, A, k, p1, p2 = candidates[0]
             tag = " [YOUR]" if has_your else ""
             print(f"     📐 {label} calibrated:  A={A:,.0f} k={k:.4f} "
@@ -3992,7 +4469,35 @@ def calibrate_models(profiles: dict, you: dict = None):
     global SPY_OFF_RANK_A, SPY_OFF_RANK_K
     global SPY_DEF_RANK_A, SPY_DEF_RANK_K
 
+    global CONFIRMED_STATS_LIVE   # module-level merged dict, read by estimate()
     atk_pts, def_pts, spo_pts, spd_pts = [], [], [], []
+
+    # Merge hardcoded CONFIRMED_STATS with any intel harvested from real
+    # attack / spy reports (private_intel.csv).  Intel wins on a per-stat
+    # basis — if we spied someone's def=4,152 yesterday that beats whatever
+    # floor was hardcoded, AND the per-stat max() floor treatment in
+    # estimate() keeps the model conservative against growth.
+    confirmed_all = {k: dict(v) for k, v in CONFIRMED_STATS.items()}   # deep-ish copy
+    try:
+        overlay = load_intel_overlay()
+        for iname, ient in overlay.items():
+            base = dict(confirmed_all.get(iname, {}))
+            for k_intel, k_cs in [
+                ("atk",     "atk"),
+                ("def",     "def"),
+                ("spy_off", "spy_off"),
+                ("spy_def", "spy_def"),
+            ]:
+                v = int(ient.get(k_intel, 0))
+                if v > 0 and v > int(base.get(k_cs, 0) or 0):
+                    base[k_cs] = v
+            # Demographic fields — prefer intel (fresher) when present.
+            for k in ("level", "race", "cls"):
+                if ient.get(k):
+                    base[k] = ient[k]
+            confirmed_all[iname] = base
+    except Exception as e:
+        print(f"  ⚠️  calibrate intel overlay failed: {e}")
 
     # Collect calibration anchor points from confirmed spy data + scraped profiles.
     # Philosophy: confirmed stats are SNAPSHOTS in time — they tell us the minimum
@@ -4003,7 +4508,9 @@ def calibrate_models(profiles: dict, you: dict = None):
     # Confirmed off_rank/def_rank in CONFIRMED_STATS is only a calibration hint for
     # players whose profile hasn't been scraped yet; once profiles are scraped the
     # live profile rank supersedes any hardcoded rank.
-    for cname, cs in CONFIRMED_STATS.items():
+    # Publish the merged dict for estimate() to read this tick.
+    CONFIRMED_STATS_LIVE = confirmed_all
+    for cname, cs in confirmed_all.items():
         p = profiles.get(cname, {})
         # Current profile rank wins — it is always more up-to-date than the rank
         # that was noted when the spy screenshot was taken.
@@ -4216,6 +4723,13 @@ def load_scraped_profiles():
 # atk/def/spy_off/spy_def are EXACT values shown on their profile.
 # citizens_idle = idle citizens shown on profile (NOT total population).
 # gold / bank = snapshot at time of screenshot (not used for estimation, just stored).
+#
+# CONFIRMED_STATS_LIVE = CONFIRMED_STATS merged with intel harvested from
+# battle/spy reports (private_intel.csv).  Populated by calibrate_models()
+# once per tick and consulted by estimate() in place of the raw hardcoded
+# dict so every fresh report immediately improves the per-player estimates.
+CONFIRMED_STATS_LIVE: dict = {}
+
 CONFIRMED_STATS = {
     # Verified directly from in-game profile screenshots.
     # atk/def/spy_off/spy_def are exact values — no estimation needed for these players.
@@ -4303,13 +4817,16 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
     rb = RACE.get(race, RACE['Human'])
     cb = CLASS.get(cls,  CLASS['Fighter'])
 
-    # ── CONFIRMED: demographic data from profile screenshots ─────────────────
+    # ── CONFIRMED: demographic data from profile screenshots + intel ────────
     # Level/race/cls are stable — use them.  Combat stats (atk/def/spy) may be
     # weeks old; compare them to the rank-calibrated model and use whichever is
     # HIGHER (players only get stronger over time, never weaker).
     # Population ceiling (see below) guards against impossibly large values.
-    if clean in CONFIRMED_STATS:
-        c = CONFIRMED_STATS[clean]
+    # CONFIRMED_STATS_LIVE is the merged dict (hardcoded + intel from reports);
+    # fall back to raw CONFIRMED_STATS when calibrate_models hasn't run yet.
+    _cs_source = CONFIRMED_STATS_LIVE or CONFIRMED_STATS
+    if clean in _cs_source:
+        c = _cs_source[clean]
         # Stable demographic overrides
         level = c.get('level', level)
         race  = c.get('race',  race)
