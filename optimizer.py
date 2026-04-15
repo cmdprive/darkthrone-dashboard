@@ -2006,10 +2006,12 @@ def _battle_log_row(mode, player_id, name, turns, gold_before, gold_after, xp, r
 
 # ── Estimates lookup (for target DEF) ────────────────────────────────────────
 def load_estimates_lookup() -> dict:
-    """Return {PlayerID (str): {est_atk, est_def, est_spy_off, est_spy_def, name}}.
-    Reads private_player_estimates.csv as written by estimator_run().  Missing
-    file or columns → empty dict (battle loop will treat every target as 'unknown'
-    and skip them, which is the safe default)."""
+    """Return {Player name (str): {est_atk, est_def, est_spy_off, est_spy_def}}.
+    Reads private_player_estimates.csv as written by estimator_run().  The
+    CSV keys by Player NAME — there's no PlayerID column — so the battle loop
+    joins on the `name` field of each scraped row.  Missing file or columns
+    → empty dict (battle loop will treat every target as 'unknown' and skip it,
+    which is the safe default)."""
     path = "private_player_estimates.csv"
     if not os.path.isfile(path):
         return {}
@@ -2017,15 +2019,18 @@ def load_estimates_lookup() -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                pid = (row.get("PlayerID") or "").strip()
-                if not pid:
+                name = (row.get("Player") or row.get("Name") or "").strip()
+                if not name:
                     continue
-                lookup[pid] = {
-                    "name":         row.get("Player", "") or row.get("Name", ""),
-                    "est_atk":      num(row.get("EstATK",     row.get("est_atk",     0))),
-                    "est_def":      num(row.get("EstDEF",     row.get("est_def",     0))),
-                    "est_spy_off":  num(row.get("EstSpyOff",  row.get("est_spy_off", 0))),
-                    "est_spy_def":  num(row.get("EstSpyDef",  row.get("est_spy_def", 0))),
+                # Normalise: strip any (YOU) marker so the attack-list join matches.
+                clean = name.replace(" (YOU)", "").strip()
+                lookup[clean] = {
+                    "name":         clean,
+                    "est_atk":      num(row.get("EstATK",    row.get("est_atk",     0))),
+                    "est_def":      num(row.get("EstDEF",    row.get("est_def",     0))),
+                    "est_spy_off":  num(row.get("EstSpyOff", row.get("est_spy_off", 0))),
+                    "est_spy_def":  num(row.get("EstSpyDef", row.get("est_spy_def", 0))),
+                    "confidence":   (row.get("Confidence",   "") or "").strip(),
                 }
     except Exception as e:
         print(f"  ⚠️  load_estimates_lookup failed: {e}")
@@ -2083,10 +2088,14 @@ def scrape_attack_candidates(page, max_pages: int = 20) -> list:
                     fort_hp = num(hpm.group(1))
                     fort_max = num(hpm.group(2))
 
-            tds = row.query_selector_all("td")
-            in_range = True
-            if len(tds) > 6:
-                in_range = "out of range" not in (tds[6].inner_text() or "").lower()
+            # "In range" = the row contains a real <button.attack-btn>.  Rows
+            # that are out of range OR belong to YOU render a disabled span
+            # (<span class="btn ... disabled">Attack</span>) instead.  Also
+            # check the <tr class="disabled"> marker for belt-and-braces.
+            in_range = (
+                row.query_selector("button.attack-btn") is not None
+                and "disabled" not in (row.get_attribute("class") or "")
+            )
 
             is_bot     = "[bot]" in name.lower()
             is_clan    = row.query_selector(".clan-badge")    is not None
@@ -2175,7 +2184,8 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
         if r.get("attack_count", 0) >= BATTLE_DAILY_MAX:
             continue
 
-        est = estimates.get(str(r["player_id"]), {})
+        # estimates CSV keys by player NAME (no PlayerID column), so join there.
+        est = estimates.get(str(r.get("name", "")).replace(" (YOU)", "").strip(), {})
         if mode == "attack":
             est_def = int(est.get("est_def", 0))
             if est_def <= 0:
@@ -2255,7 +2265,13 @@ def _submit_spy_form(page, player_id: str) -> None:
 def _parse_battle_result(page) -> dict:
     """Inspect the page after a POST and return a result dict.
     Recognized keys: result, xp, gold_gained, detail.
-    result ∈ {win, loss, out_of_range, exhausted, spy_ok, spy_fail, error}."""
+    result ∈ {win, loss, out_of_range, exhausted, spy_ok, spy_fail, unknown}.
+
+    IMPORTANT — the attack-list page contains '<option>Out of range</option>'
+    in a filter dropdown, so a naive `"out of range" in body` match produces a
+    false positive on EVERY response.  We use context-rich phrases that only
+    appear in actual error messages, not UI labels.
+    """
     try:
         url = page.url or ""
     except Exception:
@@ -2264,37 +2280,53 @@ def _parse_battle_result(page) -> dict:
         raise BattleStop("session", "redirected to login")
 
     try:
-        body = (page.inner_text("body") or "").lower()
+        body = (page.inner_text("body") or "")
     except Exception:
         body = ""
 
-    if "insufficient turns" in body or "not enough turns" in body:
+    def has(pattern: str) -> bool:
+        return re.search(pattern, body, re.IGNORECASE) is not None
+
+    # ── Hard stops that unwind the loop ────────────────────────────────────
+    # "insufficient turns" is specific enough; "not enough turns" + context.
+    if has(r"insufficient\s+turns") or has(r"not\s+enough\s+turns\s+(to|for|remaining)"):
         raise BattleStop("turns", "game reports insufficient turns")
-    if "not enough gold" in body:
+    if has(r"not\s+enough\s+gold") or has(r"insufficient\s+gold"):
         raise BattleStop("gold", "game reports insufficient gold")
-    if "out of range" in body or "out of your range" in body:
+
+    # ── Per-target errors (skip this target, keep looping) ─────────────────
+    # Require sentence context — "you are / target is / they are out of range"
+    # — so the filter dropdown option ("Out of range") doesn't match.
+    if has(r"(you|target|player|they)\s+(is|are|'re)\s+out\s+of\s+(range|your\s+range)"):
         return {"result": "out_of_range"}
-    if ("already attacked" in body or "maximum" in body
-            or "5 times" in body or "attack limit" in body):
+    if has(r"(already\s+attacked.*\d+.*times|attack.*limit.*reached|5\s*/\s*5\s+today|reached.*daily.*limit)"):
         return {"result": "exhausted"}
 
-    xp_m   = re.search(r"gained\s+([\d,]+)\s*xp",   body) or re.search(r"\+\s*([\d,]+)\s*xp", body)
-    gold_m = re.search(r"stole\s+([\d,]+)\s*gold",  body) or re.search(r"\+\s*([\d,]+)\s*gold", body)
-    xp     = num(xp_m.group(1))   if xp_m   else 0
-    gg     = num(gold_m.group(1)) if gold_m else 0
+    # ── Parse XP / gold numbers out of any victory phrasing ────────────────
+    xp_m = (re.search(r"gained\s+([\d,]+)\s*xp", body, re.I)
+            or re.search(r"\+\s*([\d,]+)\s*xp",   body, re.I)
+            or re.search(r"experience[^0-9]+([\d,]+)", body, re.I))
+    gold_m = (re.search(r"stole\s+([\d,]+)\s*gold", body, re.I)
+              or re.search(r"\+\s*([\d,]+)\s*gold",  body, re.I)
+              or re.search(r"plundered[^0-9]+([\d,]+)", body, re.I))
+    xp = num(xp_m.group(1))   if xp_m   else 0
+    gg = num(gold_m.group(1)) if gold_m else 0
 
-    if "you lost" in body or "attack failed" in body:
-        return {"result": "loss", "xp": xp, "gold_gained": gg}
-
-    if "spy" in body and ("successful" in body or "reveal" in body or "intelligence" in body):
+    # ── Spy-specific outcomes ──────────────────────────────────────────────
+    if has(r"(spy|recon|reveal|intelligence).*?(success|gathered|complete)"):
         return {"result": "spy_ok", "xp": 0, "gold_gained": 0}
-    if "spy" in body and ("failed" in body or "caught" in body):
+    if has(r"(spy|recon).*?(fail|caught|alert)"):
         return {"result": "spy_fail", "xp": 0, "gold_gained": 0}
 
+    # ── Attack outcomes ────────────────────────────────────────────────────
+    if has(r"(you\s+lost|attack\s+failed|defeat|unsuccessful\s+attack)"):
+        return {"result": "loss", "xp": xp, "gold_gained": gg}
+    if has(r"(victory|you\s+won|successful\s+attack|battle\s+report|you\s+attacked)"):
+        return {"result": "win", "xp": xp, "gold_gained": gg}
     if xp > 0 or gg > 0:
         return {"result": "win", "xp": xp, "gold_gained": gg}
 
-    # Fallback: unknown — treat as success to avoid blocking, but mark it.
+    # No marker matched — unknown.  Don't claim success, don't claim failure.
     return {"result": "unknown"}
 
 
@@ -2316,7 +2348,20 @@ def do_attack(page, target: dict, turns: int, log_fn, dry_run: bool = False) -> 
     except Exception:
         pass
     res = _parse_battle_result(page)
-    gold_after = read_live_header(page).get("gold", gold_before)
+    # On 'unknown' results, dump the response so we can diagnose what the
+    # server actually returned.  Kept to the latest response only (overwrite).
+    if res.get("result") == "unknown":
+        try:
+            _unhide("debug_battle_response.html")
+            with open("debug_battle_response.html", "w", encoding="utf-8") as f:
+                f.write(f"<!-- URL: {page.url} -->\n")
+                f.write(page.content() or "")
+        except Exception:
+            pass
+    # On error pages the header selectors may not match → 0.  Fall back to
+    # gold_before so the audit log is meaningful instead of "went to zero".
+    post_hdr = read_live_header(page)
+    gold_after = post_hdr.get("gold", 0) or gold_before
 
     _battle_log_row("attack", pid, name, turns, gold_before, gold_after,
                     res.get("xp", 0), res.get("result", "unknown"))
@@ -2360,7 +2405,8 @@ def do_spy(page, target: dict, log_fn, dry_run: bool = False) -> dict:
     except Exception:
         pass
     res = _parse_battle_result(page)
-    gold_after = read_live_header(page).get("gold", gold_before)
+    post_hdr = read_live_header(page)
+    gold_after = post_hdr.get("gold", 0) or gold_before
 
     _battle_log_row("spy", pid, name, SPY_TURNS_COST, gold_before, gold_after,
                     0, res.get("result", "unknown"))
