@@ -417,13 +417,15 @@ def read_state(page):
         });
         return result;
     }""")
+    # BUILDING_TYPE_ID is {name: int_id} (line ~1310).  Invert to {int_id: name}
+    # so we can resolve the scraper's string-keyed id dict back to names.
     id_to_bname = {v: k for k, v in BUILDING_TYPE_ID.items()}
     s["buildings"] = {}
     for id_str, info in bldg_js.items():
         bname = id_to_bname.get(int(id_str))
         if bname:
             s["buildings"][bname] = info["level"]
-    # Fallbacks from overview text
+    # Fallbacks from overview text (in case DOM scrape missed something)
     if not s["buildings"].get("Mine") and s.get("mine_lv"):
         s["buildings"]["Mine"] = s["mine_lv"]
     if not s["buildings"].get("Housing") and s.get("housing_lv"):
@@ -4068,7 +4070,13 @@ def scrape_armory(page, ts):
         print(f"     ⚠️ Armory failed: {e}")
 
 
-BUILDING_TYPE_ID = {
+# Reverse lookup used by scrape_buildings().  NOTE: this is intentionally a
+# separate variable from BUILDING_TYPE_ID (line ~1310) which is {name→id};
+# a previous version re-used the same name here and silently clobbered the
+# optimizer's forward-lookup dict, causing _build() to fail with "Unknown
+# building: Housing" and read_state() to stop populating s["buildings"]
+# for every building except Mine (which had a separate overview fallback).
+BUILDING_NAME_BY_ID = {
     1: "Fortification", 2: "Armory", 3: "Mine", 4: "Spy Academy",
     5: "Barracks", 6: "Housing", 7: "Mercenary Camp",
 }
@@ -4100,7 +4108,7 @@ def scrape_buildings(page, ts):
         rows = []
         buildings_live = {}
         for id_str, info in bldg_js.items():
-            name = BUILDING_TYPE_ID.get(int(id_str), f"building_{id_str}")
+            name = BUILDING_NAME_BY_ID.get(int(id_str), f"building_{id_str}")
             rows.append([ts, name, int(id_str), info["level"], info["max"]])
             buildings_live[name] = info["level"]
 
