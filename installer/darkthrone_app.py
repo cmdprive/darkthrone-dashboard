@@ -118,6 +118,10 @@ class DarkThroneApp:
         self._opt_stop   = threading.Event()
         self._opt_thread = None
 
+        # Battle-loop state (auto-attack / auto-spy).  Widgets created in _build_ui.
+        self._battle_stop   = threading.Event()
+        self._battle_thread = None
+
         self._build_ui()
         self._check_auth()
         self._first_run_warning()
@@ -163,9 +167,14 @@ class DarkThroneApp:
         if os.path.isfile(AUTH_FILE):
             self._auth_lbl.config(text="● Logged in", fg=C["green"])
             self._opt_start_btn.config(state="normal")
+            # Battle button only enabled if we have an auth session.
+            if hasattr(self, "_battle_start_btn"):
+                self._battle_start_btn.config(state="normal")
         else:
             self._auth_lbl.config(text="○ Not logged in", fg=C["dim"])
             self._opt_start_btn.config(state="disabled")
+            if hasattr(self, "_battle_start_btn"):
+                self._battle_start_btn.config(state="disabled")
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -242,6 +251,71 @@ class DarkThroneApp:
 
         self._divider(sb)
 
+        # AUTO BATTLE
+        self._section(sb, "AUTO BATTLE")
+        self._battle_lbl = self._label(sb, "○ Stopped", C["dim"])
+        self._battle_lbl.pack(anchor="w", padx=4, pady=(0, 4))
+
+        # Mode radio — attack vs spy
+        self._battle_mode = tk.StringVar(value=self._cfg.get("battle_mode", "attack"))
+        mode_frame = tk.Frame(sb, bg=C["bg"])
+        mode_frame.pack(fill="x", pady=(0, 2))
+        for val, lbl in (("attack", "⚔ Attack"), ("spy", "🔍 Spy")):
+            tk.Radiobutton(
+                mode_frame, text=lbl, variable=self._battle_mode, value=val,
+                command=self._on_battle_mode_change,
+                bg=C["bg"], fg=C["text"], selectcolor=C["card"],
+                activebackground=C["bg"], activeforeground=C["gold"],
+                font=("Segoe UI", 9), anchor="w", cursor="hand2",
+            ).pack(side="left", padx=(0, 8))
+
+        # Turns per hit (1-10 spinbox)
+        tf = tk.Frame(sb, bg=C["bg"])
+        tf.pack(fill="x", pady=1)
+        tk.Label(tf, text="Turns:", bg=C["bg"], fg=C["dim"],
+                 font=("Segoe UI", 8), width=7, anchor="w").pack(side="left")
+        self._battle_turns = tk.IntVar(value=int(self._cfg.get("battle_turns", 5)))
+        tk.Spinbox(tf, from_=1, to=10, textvariable=self._battle_turns,
+                   width=4, font=("Segoe UI", 9),
+                   bg=C["card"], fg=C["text"],
+                   buttonbackground=C["btn"], relief="flat", bd=0).pack(side="left")
+
+        # Min ATK margin entry
+        mf = tk.Frame(sb, bg=C["bg"])
+        mf.pack(fill="x", pady=1)
+        tk.Label(mf, text="Margin:", bg=C["bg"], fg=C["dim"],
+                 font=("Segoe UI", 8), width=7, anchor="w").pack(side="left")
+        self._battle_margin = tk.StringVar(value=str(self._cfg.get("battle_margin", 1.2)))
+        tk.Entry(mf, textvariable=self._battle_margin, width=5,
+                 font=("Segoe UI", 9),
+                 bg=C["card"], fg=C["text"], relief="flat", bd=0,
+                 insertbackground=C["text"]).pack(side="left")
+
+        # Skip checkboxes
+        self._battle_skip_friends = tk.BooleanVar(value=self._cfg.get("battle_skip_friends", True))
+        self._battle_skip_clan    = tk.BooleanVar(value=self._cfg.get("battle_skip_clan",    True))
+        self._battle_skip_bots    = tk.BooleanVar(value=self._cfg.get("battle_skip_bots",    False))
+        for var, txt in (
+            (self._battle_skip_friends, "Skip friends"),
+            (self._battle_skip_clan,    "Skip clanmates"),
+            (self._battle_skip_bots,    "Skip bots"),
+        ):
+            tk.Checkbutton(
+                sb, text=txt, variable=var,
+                command=self._save_battle_cfg,
+                bg=C["bg"], fg=C["text"], selectcolor=C["card"],
+                activebackground=C["bg"], activeforeground=C["gold"],
+                font=("Segoe UI", 8), anchor="w", cursor="hand2",
+            ).pack(fill="x", padx=2, pady=0)
+
+        self._battle_start_btn = self._button(
+            sb, "▶  Start Battle", self._start_battle, state="disabled")
+        self._battle_stop_btn = self._button(
+            sb, "■  Stop Battle", self._stop_battle,
+            fg=C["dim"], state="disabled")
+
+        self._divider(sb)
+
         # DASHBOARD
         self._section(sb, "VIEW")
         self._button(sb, "📊  Growth Chart",      self._open_chart)
@@ -292,6 +366,7 @@ class DarkThroneApp:
             ("gold",   C["gold"]),   ("green", C["green"]),
             ("red",    C["red"]),    ("dim",   C["dim"]),
             ("orange", C["orange"]), ("blue",  C["blue"]),
+            ("battle", "#67e8f9"),   # cyan — auto-battle activity
         ]:
             self._log.tag_config(tag, foreground=color)
 
@@ -389,6 +464,12 @@ class DarkThroneApp:
     def _start_opt(self):
         if self._opt_thread and self._opt_thread.is_alive():
             return
+        if self._battle_thread and self._battle_thread.is_alive():
+            messagebox.showwarning(
+                "Auto-Battle running",
+                "Stop auto-battle before starting the optimizer — "
+                "they share the browser session.")
+            return
         if not os.path.isfile(AUTH_FILE):
             messagebox.showwarning("Not logged in", "Please log in first.")
             return
@@ -450,6 +531,92 @@ class DarkThroneApp:
             self._ui(self._opt_lbl.config, text="○ Stopped", fg=C["dim"])
             self._ui(self._log_write, "■ Optimizer stopped.\n", "dim")
             self._ui(self._status, "Optimizer stopped.")
+
+    # ── Auto-Battle (attack + spy) ────────────────────────────────────────────
+    def _on_battle_mode_change(self):
+        self._cfg["battle_mode"] = self._battle_mode.get()
+        self._save_config_file()
+
+    def _save_battle_cfg(self):
+        """Persist battle panel values to user_config.json on any change."""
+        try:
+            self._cfg["battle_mode"]         = self._battle_mode.get()
+            self._cfg["battle_turns"]        = int(self._battle_turns.get())
+            self._cfg["battle_margin"]       = float(self._battle_margin.get() or 1.2)
+            self._cfg["battle_skip_friends"] = bool(self._battle_skip_friends.get())
+            self._cfg["battle_skip_clan"]    = bool(self._battle_skip_clan.get())
+            self._cfg["battle_skip_bots"]    = bool(self._battle_skip_bots.get())
+            self._save_config_file()
+        except Exception:
+            pass
+
+    def _battle_log(self, msg: str, tag: str = "battle"):
+        """Callback passed to optimizer.battle_loop.  Pushes to the shared log
+        widget on the UI thread.  No stdout redirect — callers can freely
+        interleave battle logs with optimizer logs."""
+        self._ui(self._log_write, msg + "\n", tag)
+
+    def _start_battle(self):
+        if self._battle_thread and self._battle_thread.is_alive():
+            return
+        if self._opt_thread and self._opt_thread.is_alive():
+            messagebox.showwarning(
+                "Optimizer running",
+                "Stop the optimizer before starting auto-battle — "
+                "they share the browser session.")
+            return
+        if not os.path.isfile(AUTH_FILE):
+            messagebox.showwarning("Not logged in", "Please log in first.")
+            return
+
+        self._save_battle_cfg()
+        self._battle_stop.clear()
+        self._battle_thread = threading.Thread(
+            target=self._run_battle, daemon=True)
+        self._battle_thread.start()
+
+        self._battle_lbl.config(text="● Running", fg=C["green"])
+        self._battle_start_btn.config(state="disabled")
+        self._battle_stop_btn.config(state="normal")
+        self._log_write(
+            f"▶ Auto-Battle started — mode={self._battle_mode.get()} "
+            f"turns/hit={self._battle_turns.get()} "
+            f"margin={self._battle_margin.get()}\n", "battle")
+
+    def _stop_battle(self):
+        self._battle_stop.set()
+        self._battle_lbl.config(text="◌ Stopping…", fg=C["orange"])
+        self._battle_start_btn.config(state="normal")
+        self._battle_stop_btn.config(state="disabled")
+        self._log_write("■ Auto-Battle will stop after the current action.\n", "dim")
+
+    def _run_battle(self):
+        import optimizer
+        try:
+            margin = float(self._battle_margin.get() or 1.2)
+        except Exception:
+            margin = 1.2
+        cfg = {
+            "mode":          self._battle_mode.get(),
+            "margin":        max(1.0, margin),
+            "turns_per_hit": int(self._battle_turns.get()),
+            "skip_friends":  bool(self._battle_skip_friends.get()),
+            "skip_clan":     bool(self._battle_skip_clan.get()),
+            "skip_bots":     bool(self._battle_skip_bots.get()),
+            "max_per_pass":  20,
+            "max_total":     200,
+            "scrape_pages":  10,
+            "dry_run":       False,
+        }
+        try:
+            optimizer.battle_loop(self._battle_stop, cfg, log_fn=self._battle_log)
+        except Exception as e:
+            self._ui(self._log_write, f"❌ Battle error: {e}\n", "red")
+        finally:
+            self._ui(self._battle_lbl.config, text="○ Stopped", fg=C["dim"])
+            self._ui(self._battle_start_btn.config, state="normal")
+            self._ui(self._battle_stop_btn.config, state="disabled")
+            self._ui(self._status, "Auto-Battle stopped.")
 
     def _open_chart(self):
         path = os.path.abspath(CHART_FILE)

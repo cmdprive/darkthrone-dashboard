@@ -180,6 +180,31 @@ def log(action, detail, g_b, g_a):
         w.writerow([ts,action,detail,g_b,g_a])
     print(f"    📝 {action}: {detail} | {g_b:,}→{g_a:,}g")
 
+# ── Lightweight live header read ───────────────────────────────────────────────
+def read_live_header(page) -> dict:
+    """Read ONLY the .stat-item header values on whatever page is currently
+    loaded.  No navigation, no overview parse — safe to call in a tight loop.
+
+    Returns {'gold', 'turns', 'citizens', 'level', 'xp', 'xp_need'}.
+    Missing values default to 0.  Used by both read_state() and battle_loop().
+    """
+    out = {"gold": 0, "turns": 0, "citizens": 0, "level": 0, "xp": 0, "xp_need": 0}
+    for sel, key in [
+        (".stat-item[title='Gold'] .stat-value",     "gold"),
+        (".stat-item[title='Citizens'] .stat-value", "citizens"),
+        (".stat-item[title='Turns'] .stat-value",    "turns"),
+        (".stat-item[title='Level'] .stat-value",    "level"),
+        (".stat-item[title='XP'] .stat-value",       "xp"),
+    ]:
+        try:
+            el = page.query_selector(sel)
+            if el:
+                out[key] = num(el.inner_text())
+        except Exception:
+            pass
+    return out
+
+
 # ── Read full game state ───────────────────────────────────────────────────────
 def read_state(page):
     # ── 1. OVERVIEW — combat stats, economy, level, XP, gear Arsenal counts ──
@@ -221,18 +246,13 @@ def read_state(page):
         m = re.search(r'(\d+)\s+Level\s+[\d,]+\s+XP', t)
         s["level"] = num(m.group(1)) if m else 0
 
-    # Header bar CSS selectors — most accurate values
-    for sel, key in [
-        (".stat-item[title='Gold'] .stat-value",     "gold"),
-        (".stat-item[title='Citizens'] .stat-value", "citizens"),
-        (".stat-item[title='Turns'] .stat-value",    "turns"),
-        (".stat-item[title='Level'] .stat-value",    "level"),
-    ]:
-        el = page.query_selector(sel)
-        if el:
-            v = num(el.inner_text())
-            if v or key == "citizens":
-                s[key] = v
+    # Header bar CSS selectors — most accurate values (delegates to helper
+    # so battle_loop can reuse the same read without the whole overview parse).
+    hdr = read_live_header(page)
+    for key in ("gold", "citizens", "turns", "level"):
+        v = hdr.get(key, 0)
+        if v or key == "citizens":
+            s[key] = v
 
     # Ranks are NOT on the overview page — read_own_ranks() fetches them
     # from /profile/{id} after save_state() using .rank-item CSS selectors
@@ -1318,7 +1338,17 @@ def run_tick():
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'='*65}\n⚡ TICK #{st['ticks']} — {ts}\n{'='*65}")
 
-    with sync_playwright() as p:
+    # Refuse if an interactive battle session is running — concurrent
+    # Playwright contexts will corrupt auth.json and fight over CSV writes.
+    if os.path.isfile(BATTLE_LOCK_FILE):
+        print("  ⏭️  Skipping tick: auto-battle is running (.battle.lock present).")
+        return
+    if not _acquire_lock(OPT_LOCK_FILE):
+        print("  ⏭️  Skipping tick: another optimizer instance holds .optimizer.lock.")
+        return
+
+    try:
+      with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(storage_state=AUTH_FILE if os.path.exists(AUTH_FILE) else None)
         page = ctx.new_page()
@@ -1452,6 +1482,9 @@ def run_tick():
             print(f"  ⚠️ Dashboard re-publish error: {_e}")
         ctx.storage_state(path=AUTH_FILE)
         browser.close()
+    finally:
+        _release_lock(OPT_LOCK_FILE)
+
 
 if __name__ == "__main__":
     print("🛡️  Smart Defense Optimizer")
@@ -1821,6 +1854,697 @@ def scrape_with_page(page, max_pages: int = 50):
     update_dashboard()
     publish_dashboard()
     print("  📡 Dashboard published.")
+
+
+# ========================================================================
+# Auto-Battle Loop  (attack + spy farming)
+# ========================================================================
+#
+# A standalone continuous loop driven by the Suite GUI.  Given the user's
+# live ATK/SPY_OFF and the estimator's per-player DEF/SPY_DEF, it picks
+# targets that are safely defeatable and submits attacks or recon spies
+# via Playwright form.submit().  Mutually exclusive with the optimizer
+# tick loop — both acquire their own lockfile before touching the browser.
+#
+# Core design points:
+#   • No persistent ledger.  The game itself exposes the daily count per
+#     target:
+#       attack: <span class="attack-limit" title="Attacks today on this player">(N/5)</span>
+#       spy:    <button title="N/5 today">🔍 N/5 ...</button>
+#     We parse those numbers on every scrape — they are authoritative and
+#     reset at the game's daily boundary automatically.
+#   • Safe-target filter: our_atk >= est_def * margin (default 1.2).
+#     Skips friends, clan members, out-of-range rows and anything whose
+#     est_def is too high.  Bots are fair game unless the user adds a skip.
+#   • Rate limited: random.uniform(2.5, 4.5) between actions plus a longer
+#     8-15s pause every 10 actions.  Matches human-ish pacing.
+#   • Honeypot guard: asserts the hidden input[name="website_url"] is empty
+#     before every form submit.  The site uses this as an anti-bot trap.
+#   • Lockfile: .battle.lock / .optimizer.lock prevent concurrent Playwright
+#     sessions from corrupting auth.json between run_scheduled.bat and
+#     interactive GUI runs.
+
+import random as _random
+
+BATTLE_LOG_FILE   = "private_battle_log.csv"
+BATTLE_LOCK_FILE  = ".battle.lock"
+OPT_LOCK_FILE     = ".optimizer.lock"
+
+# Rate-limit constants — used by battle_loop only.  Fine-tune here if the
+# server gets cranky; do NOT expose these in the GUI (too much rope).
+BATTLE_MIN_DELAY        = 2.5
+BATTLE_MAX_DELAY        = 4.5
+BATTLE_LONG_DELAY_MIN   = 8.0
+BATTLE_LONG_DELAY_MAX   = 15.0
+BATTLE_LONG_PAUSE_EVERY = 10
+
+# Regex to pull the "(N/5)" counter out of an attack-limit span or spy button.
+ATTACK_LIMIT_RE = re.compile(r"\((\d+)\s*/\s*5\)")
+SPY_LIMIT_RE    = re.compile(r"(\d+)\s*/\s*5")
+
+# Daily max per target — both attacks and spies cap at 5 per day, per game.
+BATTLE_DAILY_MAX = 5
+
+# Fixed spy cost from the game page.
+SPY_GOLD_COST  = 3000
+SPY_TURNS_COST = 2
+
+
+class BattleStop(Exception):
+    """Raised to unwind battle_loop cleanly with a reason string.
+    Reason is one of: 'user', 'turns', 'gold', 'session', 'no_targets', 'error'."""
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
+# ── Lockfiles (prevent concurrent Playwright sessions) ───────────────────────
+def _acquire_lock(path: str) -> bool:
+    """Atomically create a PID-bearing lockfile.  Returns True on success.
+    If the file exists but the PID is dead, steals the lock and returns True."""
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        pass
+    # Already-locked path: check if the owning PID is still alive.
+    try:
+        with open(path, "r", encoding="ascii") as f:
+            pid = int((f.read() or "0").strip() or "0")
+    except Exception:
+        pid = 0
+    if pid > 0 and _pid_alive(pid):
+        return False
+    # Stale lock — steal it.
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _release_lock(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"  ⚠️  lock release failed for {path}: {e}")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort cross-platform PID liveness check.  False positives are safe
+    (we'd just refuse to start, user retries).  False negatives could double-run
+    the browser, so we err on the side of 'assume alive'."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+            if h:
+                ctypes.windll.kernel32.CloseHandle(h)
+                return True
+            return False
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+
+
+# ── Battle log CSV (audit trail) ─────────────────────────────────────────────
+BATTLE_LOG_COLUMNS = [
+    "Timestamp", "Mode", "PlayerID", "Player", "Turns",
+    "GoldBefore", "GoldAfter", "XpGained", "Result",
+]
+
+def _battle_log_row(mode, player_id, name, turns, gold_before, gold_after, xp, result):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _unhide(BATTLE_LOG_FILE)
+    new = not os.path.isfile(BATTLE_LOG_FILE)
+    with open(BATTLE_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(BATTLE_LOG_COLUMNS)
+        w.writerow([ts, mode, player_id, name, turns, gold_before, gold_after, xp, result])
+
+
+# ── Estimates lookup (for target DEF) ────────────────────────────────────────
+def load_estimates_lookup() -> dict:
+    """Return {PlayerID (str): {est_atk, est_def, est_spy_off, est_spy_def, name}}.
+    Reads private_player_estimates.csv as written by estimator_run().  Missing
+    file or columns → empty dict (battle loop will treat every target as 'unknown'
+    and skip them, which is the safe default)."""
+    path = "private_player_estimates.csv"
+    if not os.path.isfile(path):
+        return {}
+    lookup = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                pid = (row.get("PlayerID") or "").strip()
+                if not pid:
+                    continue
+                lookup[pid] = {
+                    "name":         row.get("Player", "") or row.get("Name", ""),
+                    "est_atk":      num(row.get("EstATK",     row.get("est_atk",     0))),
+                    "est_def":      num(row.get("EstDEF",     row.get("est_def",     0))),
+                    "est_spy_off":  num(row.get("EstSpyOff",  row.get("est_spy_off", 0))),
+                    "est_spy_def":  num(row.get("EstSpyDef",  row.get("est_spy_def", 0))),
+                }
+    except Exception as e:
+        print(f"  ⚠️  load_estimates_lookup failed: {e}")
+    return lookup
+
+
+# ── Scrape attack list for live battle candidates ────────────────────────────
+def scrape_attack_candidates(page, max_pages: int = 20) -> list:
+    """Paginates the attack list and returns one dict per target row.
+    Same shape as _do_scrape but includes the per-target daily counter
+    (attack_count) and attack-form id.  Does NOT write any CSV — pure
+    read path for the battle loop."""
+    rows_out = []
+    last_fp = ""
+    for page_num in range(1, max_pages + 1):
+        url = f"{BASE_ATTACK_URL}?{ATTACK_PARAMS}&page={page_num}"
+        try:
+            page.goto(url)
+            page.wait_for_selector("#battlelist-table tbody tr", timeout=15000)
+        except Exception:
+            break
+
+        player_rows = page.query_selector_all("#battlelist-table tbody tr[data-name]")
+        page_names = []
+        for row in player_rows:
+            link_el = row.query_selector("a.player-link")
+            href    = link_el.get_attribute("href") if link_el else ""
+            m       = re.search(r"/player/(\d+)", href or "")
+            pid     = m.group(1) if m else ""
+            if not pid:
+                continue
+
+            name_span = row.query_selector("a.player-link span:not([class])")
+            name = name_span.inner_text().replace("(YOU)", "").strip() if name_span else ""
+            if not name:
+                name = row.get_attribute("data-name") or ""
+            if not name:
+                continue
+            if "(YOU)" in name:
+                continue
+            page_names.append(name)
+
+            level   = num(row.get_attribute("data-level") or 0)
+            race    = row.get_attribute("data-race")  or ""
+            gold    = num(row.get_attribute("data-gold") or 0)
+            fort_p  = num(row.get_attribute("data-fort") or 0)
+
+            fort_hp = fort_p
+            fort_max = 0
+            fb = row.query_selector(".fort-bar")
+            if fb:
+                title = fb.get_attribute("title") or ""
+                hpm = re.match(r"(\d+)/(\d+)", title)
+                if hpm:
+                    fort_hp = num(hpm.group(1))
+                    fort_max = num(hpm.group(2))
+
+            tds = row.query_selector_all("td")
+            in_range = True
+            if len(tds) > 6:
+                in_range = "out of range" not in (tds[6].inner_text() or "").lower()
+
+            is_bot     = "[bot]" in name.lower()
+            is_clan    = row.query_selector(".clan-badge")    is not None
+            is_friend  = row.query_selector(".friend-badge")  is not None
+            is_hitlist = row.query_selector(".hitlist-badge") is not None
+
+            # Daily attack counter — "(N/5)"
+            attack_count = 0
+            al = row.query_selector(".attack-limit")
+            if al:
+                txt = al.inner_text() or ""
+                lm = ATTACK_LIMIT_RE.search(txt)
+                if lm:
+                    attack_count = int(lm.group(1))
+
+            rows_out.append({
+                "player_id":    pid,
+                "name":         name,
+                "level":        level,
+                "race":         race,
+                "gold":         gold,
+                "fort_pct":     fort_p,
+                "fort_hp":      fort_hp,
+                "fort_max":     fort_max,
+                "in_range":     in_range,
+                "is_bot":       is_bot,
+                "is_clan":      is_clan,
+                "is_friend":    is_friend,
+                "is_hitlist":   is_hitlist,
+                "attack_count": attack_count,
+            })
+
+        fp = ",".join(page_names)
+        if not page_names or fp == last_fp:
+            break
+        last_fp = fp
+    return rows_out
+
+
+def read_reset_countdown(page) -> int:
+    """Return seconds until the daily attack counter resets, or 0 if unknown.
+    The attack page embeds <span id='attackResetTimer' data-seconds='7986'>2h 13m</span>."""
+    try:
+        el = page.query_selector("#attackResetTimer")
+        if el:
+            s = el.get_attribute("data-seconds") or "0"
+            return int(s)
+    except Exception:
+        pass
+    return 0
+
+
+# ── Target picker (pure function — unit-testable) ───────────────────────────
+def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
+                         cfg: dict, mode: str = "attack") -> list:
+    """Filter + sort battle candidates.
+    rows: list from scrape_attack_candidates()
+    estimates: {PlayerID: {est_def, est_spy_def, ...}} from load_estimates_lookup()
+    our_stats: {'atk', 'spy_off', 'gold', 'turns', ...}
+    cfg: {margin, skip_friends, skip_clan, skip_bots, max_per_pass, ...}
+    mode: 'attack' or 'spy'
+    Returns filtered+sorted list (same dict shape as rows, with extras)."""
+    margin = float(cfg.get("margin", 1.2)) or 1.2
+    if margin < 1.0:
+        margin = 1.0
+    skip_friends = bool(cfg.get("skip_friends", True))
+    skip_clan    = bool(cfg.get("skip_clan",    True))
+    skip_bots    = bool(cfg.get("skip_bots",    False))
+    max_per_pass = int(cfg.get("max_per_pass",  20)) or 20
+
+    our_atk     = int(our_stats.get("atk",     0))
+    our_spy_off = int(our_stats.get("spy_off", 0))
+    our_gold    = int(our_stats.get("gold",    0))
+    our_turns   = int(our_stats.get("turns",   0))
+
+    safe = []
+    for r in rows:
+        if not r.get("in_range", True):
+            continue
+        if skip_friends and r.get("is_friend"):
+            continue
+        if skip_clan and r.get("is_clan"):
+            continue
+        if skip_bots and r.get("is_bot"):
+            continue
+        if r.get("attack_count", 0) >= BATTLE_DAILY_MAX:
+            continue
+
+        est = estimates.get(str(r["player_id"]), {})
+        if mode == "attack":
+            est_def = int(est.get("est_def", 0))
+            if est_def <= 0:
+                continue   # unknown defense → unsafe by default
+            if our_atk < int(est_def * margin):
+                continue
+            r["est_def"] = est_def
+            r["atk_ratio"] = our_atk / max(est_def, 1)
+            safe.append(r)
+        elif mode == "spy":
+            if our_gold  < SPY_GOLD_COST:  continue
+            if our_turns < SPY_TURNS_COST: continue
+            est_sd = int(est.get("est_spy_def", 0))
+            if est_sd <= 0:
+                continue
+            if our_spy_off < int(est_sd * margin):
+                continue
+            r["est_spy_def"] = est_sd
+            r["spy_ratio"] = our_spy_off / max(est_sd, 1)
+            safe.append(r)
+
+    if mode == "attack":
+        safe.sort(key=lambda x: (-x.get("gold", 0), -x.get("fort_pct", 0)))
+    else:
+        safe.sort(key=lambda x: (-x.get("gold", 0), -x.get("spy_ratio", 0)))
+    return safe[:max_per_pass]
+
+
+# ── Action executors ─────────────────────────────────────────────────────────
+def _submit_attack_form(page, player_id: str, turns: int) -> None:
+    """Submit the hidden <form id='attack-form-{id}'> via page.evaluate.
+    Sets the turns input value, dispatches input/change events (so any JS
+    listeners run), asserts the honeypot input is empty, then calls
+    form.submit() which posts natively with cookies + _token intact."""
+    js = r"""
+    (args) => {
+        const form = document.getElementById('attack-form-' + args.pid);
+        if (!form) return {ok:false, err:'form_not_found'};
+        const hp = form.querySelector('input[name="website_url"]');
+        if (hp && hp.value) return {ok:false, err:'honeypot_filled'};
+        const ti = form.querySelector('input[name="turns"], input.turns-input, select[name="turns"]');
+        if (!ti) return {ok:false, err:'turns_input_not_found'};
+        ti.value = String(args.turns);
+        ti.dispatchEvent(new Event('input',  {bubbles:true}));
+        ti.dispatchEvent(new Event('change', {bubbles:true}));
+        form.submit();
+        return {ok:true};
+    }
+    """
+    result = page.evaluate(js, {"pid": str(player_id), "turns": int(turns)})
+    if not result.get("ok"):
+        raise BattleStop("error", f"submit_attack:{result.get('err','unknown')}")
+
+
+def _submit_spy_form(page, player_id: str) -> None:
+    """Submit the spy recon form by clicking its button via page.evaluate.
+    The spy page has one <form action='/game/spy/{id}'> per target — we find
+    it by action URL and call form.submit()."""
+    js = r"""
+    (args) => {
+        const forms = document.querySelectorAll('form[action$="/spy/' + args.pid + '"]');
+        if (!forms.length) return {ok:false, err:'form_not_found'};
+        const form = forms[0];
+        const hp = form.querySelector('input[name="website_url"]');
+        if (hp && hp.value) return {ok:false, err:'honeypot_filled'};
+        const op = form.querySelector('input[name="operation"]');
+        if (op) op.value = 'recon';
+        form.submit();
+        return {ok:true};
+    }
+    """
+    result = page.evaluate(js, {"pid": str(player_id)})
+    if not result.get("ok"):
+        raise BattleStop("error", f"submit_spy:{result.get('err','unknown')}")
+
+
+def _parse_battle_result(page) -> dict:
+    """Inspect the page after a POST and return a result dict.
+    Recognized keys: result, xp, gold_gained, detail.
+    result ∈ {win, loss, out_of_range, exhausted, spy_ok, spy_fail, error}."""
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    if "/login" in url:
+        raise BattleStop("session", "redirected to login")
+
+    try:
+        body = (page.inner_text("body") or "").lower()
+    except Exception:
+        body = ""
+
+    if "insufficient turns" in body or "not enough turns" in body:
+        raise BattleStop("turns", "game reports insufficient turns")
+    if "not enough gold" in body:
+        raise BattleStop("gold", "game reports insufficient gold")
+    if "out of range" in body or "out of your range" in body:
+        return {"result": "out_of_range"}
+    if ("already attacked" in body or "maximum" in body
+            or "5 times" in body or "attack limit" in body):
+        return {"result": "exhausted"}
+
+    xp_m   = re.search(r"gained\s+([\d,]+)\s*xp",   body) or re.search(r"\+\s*([\d,]+)\s*xp", body)
+    gold_m = re.search(r"stole\s+([\d,]+)\s*gold",  body) or re.search(r"\+\s*([\d,]+)\s*gold", body)
+    xp     = num(xp_m.group(1))   if xp_m   else 0
+    gg     = num(gold_m.group(1)) if gold_m else 0
+
+    if "you lost" in body or "attack failed" in body:
+        return {"result": "loss", "xp": xp, "gold_gained": gg}
+
+    if "spy" in body and ("successful" in body or "reveal" in body or "intelligence" in body):
+        return {"result": "spy_ok", "xp": 0, "gold_gained": 0}
+    if "spy" in body and ("failed" in body or "caught" in body):
+        return {"result": "spy_fail", "xp": 0, "gold_gained": 0}
+
+    if xp > 0 or gg > 0:
+        return {"result": "win", "xp": xp, "gold_gained": gg}
+
+    # Fallback: unknown — treat as success to avoid blocking, but mark it.
+    return {"result": "unknown"}
+
+
+def do_attack(page, target: dict, turns: int, log_fn, dry_run: bool = False) -> dict:
+    """Attack target with N turns.  Returns the parse_battle_result dict."""
+    pid  = str(target["player_id"])
+    name = target["name"]
+    gold_before = read_live_header(page).get("gold", 0)
+
+    if dry_run:
+        log_fn(f"  [DRY] ⚔  would attack {name} (pid={pid}) with {turns} turns  (ratio {target.get('atk_ratio',0):.2f}×)", "dim")
+        return {"result": "dry_run", "xp": 0, "gold_gained": 0}
+
+    # Must be on the attack list page — the attack-form is inlined there.
+    # Caller is responsible for having the list loaded.
+    _submit_attack_form(page, pid, turns)
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    res = _parse_battle_result(page)
+    gold_after = read_live_header(page).get("gold", gold_before)
+
+    _battle_log_row("attack", pid, name, turns, gold_before, gold_after,
+                    res.get("xp", 0), res.get("result", "unknown"))
+
+    result = res.get("result", "unknown")
+    xp     = res.get("xp", 0)
+    gg     = res.get("gold_gained", 0)
+    if result == "win":
+        log_fn(f"  ⚔  {name}: WIN  +{xp:,} xp  +{gg:,}g  (now {gold_after:,}g)", "battle")
+    elif result == "loss":
+        log_fn(f"  ⚔  {name}: LOSS — estimate was too low", "red")
+    elif result == "out_of_range":
+        log_fn(f"  ⚔  {name}: out of range (skipping)", "dim")
+    elif result == "exhausted":
+        log_fn(f"  ⚔  {name}: already at 5/5 today", "dim")
+    else:
+        log_fn(f"  ⚔  {name}: {result}  +{xp:,} xp", "battle")
+    return res
+
+
+def do_spy(page, target: dict, log_fn, dry_run: bool = False) -> dict:
+    """Recon spy the target.  Returns the parse_battle_result dict."""
+    pid  = str(target["player_id"])
+    name = target["name"]
+    gold_before = read_live_header(page).get("gold", 0)
+
+    if dry_run:
+        log_fn(f"  [DRY] 🔍 would spy {name} (pid={pid})  (ratio {target.get('spy_ratio',0):.2f}×)", "dim")
+        return {"result": "dry_run", "xp": 0, "gold_gained": 0}
+
+    # Navigate to the intelligence page first — the spy forms live there.
+    try:
+        page.goto(f"{BASE_URL}/intelligence")
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+
+    _submit_spy_form(page, pid)
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    res = _parse_battle_result(page)
+    gold_after = read_live_header(page).get("gold", gold_before)
+
+    _battle_log_row("spy", pid, name, SPY_TURNS_COST, gold_before, gold_after,
+                    0, res.get("result", "unknown"))
+
+    result = res.get("result", "unknown")
+    if result == "spy_ok" or result == "unknown":
+        log_fn(f"  🔍 {name}: recon ok  (now {gold_after:,}g)", "battle")
+    elif result == "spy_fail":
+        log_fn(f"  🔍 {name}: recon failed — spy defense too high", "red")
+    else:
+        log_fn(f"  🔍 {name}: {result}", "battle")
+    return res
+
+
+# ── Main battle loop (entry point called from GUI thread) ───────────────────
+def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
+    """Run auto-attack or auto-spy until the user stops, turns/gold run out,
+    the session expires, or no safe targets remain.
+
+    cfg keys (all optional, defaults in brackets):
+      mode          : 'attack' | 'spy'              ['attack']
+      margin        : float                         [1.2]
+      turns_per_hit : int 1-10                      [5]
+      skip_friends  : bool                          [True]
+      skip_clan     : bool                          [True]
+      skip_bots     : bool                          [False]
+      max_per_pass  : int (soft cap per scrape)     [20]
+      max_total     : int (hard cap for whole run)  [200]
+      dry_run       : bool                          [False]
+
+    log_fn(msg, tag): callback for the GUI log.  No stdout redirect is used,
+    so the caller does not need to worry about capture threads."""
+    from playwright.sync_api import sync_playwright
+
+    mode = (cfg.get("mode") or "attack").lower()
+    if mode not in ("attack", "spy"):
+        log_fn(f"  ❌ unknown battle mode: {mode}", "red")
+        return {"ok": False, "reason": "bad_mode", "actions": 0}
+
+    turns_per_hit = int(cfg.get("turns_per_hit", 5))
+    turns_per_hit = max(1, min(10, turns_per_hit))
+    max_total     = int(cfg.get("max_total", 200))
+    dry_run       = bool(cfg.get("dry_run", False))
+
+    # Refuse if the optimizer is running.
+    if os.path.isfile(OPT_LOCK_FILE):
+        log_fn("  ❌ Optimizer appears to be running (.optimizer.lock present) — "
+               "stop it first.", "red")
+        return {"ok": False, "reason": "opt_running", "actions": 0}
+
+    if not _acquire_lock(BATTLE_LOCK_FILE):
+        log_fn("  ❌ Another battle session is already running — aborting.", "red")
+        return {"ok": False, "reason": "locked", "actions": 0}
+
+    actions = 0
+    wins    = 0
+    losses  = 0
+    t0      = time.time()
+    reason  = "done"
+
+    log_fn(f"⚔  Battle loop starting — mode={mode} margin={cfg.get('margin',1.2)} "
+           f"turns/hit={turns_per_hit} dry={dry_run}", "battle")
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(storage_state=AUTH_FILE)
+            page = ctx.new_page()
+            try:
+                # Warm up: hit the attack list once to get header + reset timer.
+                page.goto(f"{BASE_ATTACK_URL}?{ATTACK_PARAMS}&page=1")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+
+                if "/login" in (page.url or ""):
+                    raise BattleStop("session", "redirected to login on warm-up")
+
+                rs = read_reset_countdown(page)
+                if rs:
+                    hrs = rs // 3600
+                    mins = (rs % 3600) // 60
+                    log_fn(f"  ⏲  Daily reset in {hrs}h {mins}m", "dim")
+
+                while not stop_event.is_set() and actions < max_total:
+                    hdr = read_live_header(page)
+                    our_stats = dict(cfg.get("our_stats") or {})
+                    our_stats["gold"]  = hdr.get("gold",  our_stats.get("gold",  0))
+                    our_stats["turns"] = hdr.get("turns", our_stats.get("turns", 0))
+
+                    if mode == "attack" and our_stats["turns"] < 1:
+                        raise BattleStop("turns", "out of turns")
+                    if mode == "spy" and our_stats["turns"] < SPY_TURNS_COST:
+                        raise BattleStop("turns", "not enough turns for spy")
+                    if mode == "spy" and our_stats["gold"] < SPY_GOLD_COST:
+                        raise BattleStop("gold", "not enough gold for spy")
+
+                    # Fresh scrape for current (N/5) counts + fort%.
+                    rows = scrape_attack_candidates(page, max_pages=int(cfg.get("scrape_pages", 10)))
+                    estimates = load_estimates_lookup()
+                    targets = pick_battle_targets(rows, estimates, our_stats, cfg, mode=mode)
+                    if not targets:
+                        log_fn("  ℹ️  No safe targets left this pass.", "dim")
+                        raise BattleStop("no_targets", "filter + daily caps exhausted pool")
+
+                    log_fn(f"  🎯 Pass: {len(targets)} candidate(s)", "dim")
+
+                    for tgt in targets:
+                        if stop_event.is_set():
+                            raise BattleStop("user", "stop requested")
+                        if actions >= max_total:
+                            raise BattleStop("user", "max_total reached")
+
+                        # Re-check live header so we don't run out mid-loop.
+                        hdr = read_live_header(page)
+                        if mode == "attack" and hdr.get("turns", 0) < turns_per_hit:
+                            # Try with smaller hit if possible.
+                            if hdr.get("turns", 0) >= 1:
+                                effective_turns = max(1, hdr["turns"])
+                            else:
+                                raise BattleStop("turns", "out of turns mid-pass")
+                        else:
+                            effective_turns = turns_per_hit
+
+                        if mode == "spy":
+                            if hdr.get("turns", 0) < SPY_TURNS_COST:
+                                raise BattleStop("turns", "not enough turns for spy")
+                            if hdr.get("gold", 0)  < SPY_GOLD_COST:
+                                raise BattleStop("gold", "not enough gold for spy")
+
+                        if mode == "attack":
+                            # Ensure we're on the attack list page for the form.
+                            if "/game/attack" not in (page.url or ""):
+                                page.goto(f"{BASE_ATTACK_URL}?{ATTACK_PARAMS}&page=1")
+                                try: page.wait_for_load_state("networkidle", timeout=15000)
+                                except Exception: pass
+                            res = do_attack(page, tgt, effective_turns, log_fn, dry_run=dry_run)
+                        else:
+                            res = do_spy(page, tgt, log_fn, dry_run=dry_run)
+
+                        actions += 1
+                        r = res.get("result", "unknown")
+                        if r == "win" or r == "spy_ok":
+                            wins += 1
+                        elif r == "loss" or r == "spy_fail":
+                            losses += 1
+
+                        # Jitter between actions.
+                        delay = _random.uniform(BATTLE_MIN_DELAY, BATTLE_MAX_DELAY)
+                        if actions % BATTLE_LONG_PAUSE_EVERY == 0:
+                            delay = _random.uniform(BATTLE_LONG_DELAY_MIN, BATTLE_LONG_DELAY_MAX)
+                            log_fn(f"  💤 long pause {delay:.1f}s (every {BATTLE_LONG_PAUSE_EVERY})", "dim")
+                        # Sleep in 0.5s slices so stop_event reacts quickly.
+                        slept = 0.0
+                        while slept < delay and not stop_event.is_set():
+                            time.sleep(min(0.5, delay - slept))
+                            slept += 0.5
+                    # end inner for — loop back to re-scrape on next pass
+            finally:
+                try:
+                    ctx.storage_state(path=AUTH_FILE)
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    except BattleStop as bs:
+        reason = bs.reason
+        log_fn(f"⚔  Battle loop stopped: {bs}", "dim")
+    except Exception as e:
+        reason = "error"
+        log_fn(f"❌ Battle loop error: {e}", "red")
+    finally:
+        _release_lock(BATTLE_LOCK_FILE)
+
+    elapsed = time.time() - t0
+    total = wins + losses
+    winrate = (wins / total * 100.0) if total else 0.0
+    log_fn(f"⚔  Done. {actions} action(s) in {elapsed/60:.1f}m — "
+           f"wins={wins} losses={losses} winrate={winrate:.0f}%", "battle")
+    return {"ok": True, "reason": reason, "actions": actions,
+            "wins": wins, "losses": losses, "elapsed": elapsed}
 
 
 # ========================================================================
