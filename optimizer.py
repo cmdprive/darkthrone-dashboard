@@ -3118,22 +3118,23 @@ def calibrate_models(profiles: dict, you: dict = None):
 
     atk_pts, def_pts, spo_pts, spd_pts = [], [], [], []
 
-    # Collect points from CONFIRMED_STATS (may be stale)
-    # Rank priority: CONFIRMED_STATS rank wins when explicitly set (e.g. off_rank=1
-    # means we verified this player is server rank 1).  Only fall back to scraped
-    # profile rank when CONFIRMED_STATS does NOT have a rank for that field.
-    # Previously "p.get() or cs.get()" let stale profile ranks override confirmed
-    # ranks (e.g. TGO profile shows rank=2 after being overtaken briefly, causing
-    # the model to anchor at (2, 394k) instead of the confirmed (1, 394k)).
+    # Collect calibration anchor points from confirmed spy data + scraped profiles.
+    # Philosophy: confirmed stats are SNAPSHOTS in time — they tell us the minimum
+    # (floor) a player had when we observed them, not their current value.
+    # Ranks change every tick; a player's profile rank is CURRENT, not the rank at
+    # which their stats were spied. We therefore always prefer the FRESHEST rank
+    # (scraped profile rank > CONFIRMED_STATS rank hint).
+    # Confirmed off_rank/def_rank in CONFIRMED_STATS is only a calibration hint for
+    # players whose profile hasn't been scraped yet; once profiles are scraped the
+    # live profile rank supersedes any hardcoded rank.
     for cname, cs in CONFIRMED_STATS.items():
         p = profiles.get(cname, {})
-        def _rank(field):
-            cs_r = cs.get(field, 0)
-            return cs_r if cs_r > 0 else p.get(field, 0)
-        ar  = _rank('off_rank')
-        dr  = _rank('def_rank')
-        sor = _rank('spy_off_rank')
-        sdr = _rank('spy_def_rank')
+        # Current profile rank wins — it is always more up-to-date than the rank
+        # that was noted when the spy screenshot was taken.
+        ar  = p.get('off_rank',     0) or cs.get('off_rank',     0)
+        dr  = p.get('def_rank',     0) or cs.get('def_rank',     0)
+        sor = p.get('spy_off_rank', 0) or cs.get('spy_off_rank', 0)
+        sdr = p.get('spy_def_rank', 0) or cs.get('spy_def_rank', 0)
         if ar  > 0 and cs.get('atk',     0): atk_pts.append((ar,  cs['atk']))
         if dr  > 0 and cs.get('def',     0): def_pts.append((dr,  cs['def']))
         if sor > 0 and cs.get('spy_off', 0): spo_pts.append((sor, cs['spy_off']))
@@ -3341,12 +3342,13 @@ CONFIRMED_STATS = {
         'gold':    782, 'bank': 1_010_000, 'citizens_idle': 1_385,
     },
     # verified from dashboard row 2026-04-15 (Fort HP 3000/3000 = Fort Lv2)
-    # off_rank=1 confirmed: server rank #1 offense — sets the ATK model ceiling
+    # atk/def are the values at time of spy — treat as FLOOR, not ceiling.
+    # Current rank comes from live profile scrape (private_player_profiles.csv).
     'TGO Jasbob1989': {
         'level': 29, 'race': 'Undead', 'cls': 'Fighter',
-        'atk': 394_000, 'def': 120_000, 'off_rank': 1,
+        'atk': 394_000, 'def': 120_000,
     },
-    # def_rank=1 on server — verified from profile screenshot 2026-04-08
+    # verified from profile screenshot 2026-04-08 — stats are a snapshot floor.
     'Radagon Of The Golden Order': {
         'level': 18, 'race': 'Goblin', 'cls': 'Cleric',
         'atk':  9_611, 'def': 77_457, 'spy_off': 4_226, 'spy_def': 3_760,
@@ -3354,13 +3356,10 @@ CONFIRMED_STATS = {
 }
 
 # ── Known players ─────────────────────────────────────────────────────────────
-# Ranks from Global Rankings leaderboard screenshot (2026-04-08).
-# Levels from Level leaderboard tab. Population from profile scrapes.
-# Ranks updated: overall=#1-10 visible, offense #1-10, defense #1-10, level #1-10
-# name, level, race, class, population, clan, overall, off_rank, def_rank
-# NOTE: level/pop/ranks here are fallback defaults only.
-# scrape_rankings() refreshes ranks every tick from the live leaderboard.
-# private_latest.json always overrides YOUR stats.
+# Fallback demographic data only — level/pop are rough estimates.
+# RANKS here (overall/off_rank/def_rank) are STALE defaults and are overridden
+# every tick by scrape_rankings() which writes private_rankings_snapshot.json.
+# Always re-scrape rankings after each game tick for accurate estimates.
 # Format: (name, level, race, class, population, clan, overall_rank, off_rank, def_rank)
 PLAYERS = [
     ('Ashcipher',                  19,'Human',  'Fighter', 2760,'RQUM', 99, 99, 99),
@@ -3428,17 +3427,14 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
         cal_def = rank_def(def_rank) if def_rank < 900 else 0
         cal_so  = rank_spy_off(s_off) if s_off < 900 else 0
         cal_sd  = rank_spy_def(s_def) if s_def < 900 else 0
-        # Confirmed stats are authoritative — always use them when present.
-        # Model fills in ONLY if the confirmed field is absent/zero.
-        # (max() was tried here but caused the model to override fresh confirmed
-        # data, e.g. showing 527k ATK when the real value is 394k.)
-        # Stale confirmed data (e.g. Radagon April-8 DEF) is acceptable because
-        # rank_snap now estimates all 259 server players, so even if a confirmed
-        # player's value is stale the server-rank ordering is still correct.
-        atk_v = c.get('atk',     0) or cal_atk
-        def_v = c.get('def',     0) or cal_def
-        spo_v = c.get('spy_off', 0) or cal_so
-        spd_v = c.get('spy_def', 0) or cal_sd
+        # Confirmed spy stats are a FLOOR (minimum observed value), not a ceiling.
+        # Players only grow stronger over time — if the rank model estimates a higher
+        # value than the last spy reading, the model is probably right.
+        # Use max(confirmed_floor, model_estimate) so estimates keep up with growth.
+        atk_v = max(c.get('atk',     0), cal_atk)
+        def_v = max(c.get('def',     0), cal_def)
+        spo_v = max(c.get('spy_off', 0), cal_so)
+        spd_v = max(c.get('spy_def', 0), cal_sd)
         # Population ceiling: a player CANNOT have more stat than their ENTIRE
         # population fully equipped.  Caps unrealistic model outliers.
         gt = max_gear_tier(level);  ut = max_unit_tier(level)
