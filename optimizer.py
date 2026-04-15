@@ -246,16 +246,26 @@ def read_state(page):
         m = re.search(pat, t)
         return num(m.group(1)) if m else 0
 
-    sent_w_count = gear_count(r'Hatchet x(\d+)') + gear_count(r'Mace x(\d+).*?SPY DEF')
+    # Sum ALL tier quantities for a unit/slot instead of reading only one
+    # hardcoded item name.  The old approach (e.g. "Blowgun x(\d+)" for spy
+    # weapons) breaks once a player upgrades past T3: the T3 count drops to
+    # zero, the code calculates a full gap, and keeps buying unnecessary gear.
+    # With sum_gear() the total owned is correct even when multiple tiers coexist:
+    #   e.g. 71 Stiletto (T5) + 1 Poison Dagger (T4) + 59 Blowgun (T3) = 131
+    #   min(131, 90 units) = 90 → gap = 0 → nothing to buy.
+    def sum_gear(unit, slot):
+        return sum(gear_count(rf'{re.escape(name)} x(\d+)')
+                   for name, _, _ in GEAR.get((unit, slot), {}).values())
+
     s["_gear_owned"] = {
-        ("soldier","weapon"): gear_count(r'Quarterstaff x(\d+)'),
-        ("soldier","armor"):  gear_count(r'Studded Leather Armor x(\d+)\s+\+\d+ ATK'),
-        ("guard",  "weapon"): gear_count(r'Spear x(\d+)'),
-        ("guard",  "armor"):  gear_count(r'Studded Leather Armor x(\d+)\s+\+\d+ DEF'),
-        ("spy",    "weapon"): gear_count(r'Blowgun x(\d+)'),
-        ("spy",    "armor"):  gear_count(r'Infiltrator Garb x(\d+)'),
-        ("sentry", "weapon"): sent_w_count,
-        ("sentry", "armor"):  gear_count(r'Studded Guard Armor x(\d+)'),
+        ("soldier","weapon"): sum_gear("soldier","weapon"),
+        ("soldier","armor"):  sum_gear("soldier","armor"),
+        ("guard",  "weapon"): sum_gear("guard",  "weapon"),
+        ("guard",  "armor"):  sum_gear("guard",  "armor"),
+        ("spy",    "weapon"): sum_gear("spy",    "weapon"),
+        ("spy",    "armor"):  sum_gear("spy",    "armor"),
+        ("sentry", "weapon"): sum_gear("sentry", "weapon"),
+        ("sentry", "armor"):  sum_gear("sentry", "armor"),
     }
 
     # ── 2. TRAINING — exact owned counts (untrain max) + citizens (train max) ──
