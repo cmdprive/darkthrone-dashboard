@@ -4109,6 +4109,33 @@ def estimator_run():
     if extra_players:
         print(f"  ℹ️  {len(extra_players)} extra players discovered from profile scan — added to estimates")
 
+    # Also include players from the rankings snapshot who are NOT already in PLAYERS
+    # or profile-scraped.  We know their server rank + level (often), so the model
+    # can produce meaningful ATK/DEF estimates for them — critical for the TOP
+    # ATK/DEF ranking to reflect the full server, not just the ~30-entry PLAYERS list.
+    snap_known = known_names | {p[0] for p in extra_players}
+    rank_snap_extra = []
+    for pname, rs in rank_snap.items():
+        if pname in snap_known or 'YOU' in pname:
+            continue
+        lv = rs.get('level', 0)
+        if lv == 0:
+            continue
+        rank_snap_extra.append((
+            pname,
+            lv,
+            rs.get('race',       '—'),
+            rs.get('cls',        '—'),
+            rs.get('population',   0),
+            rs.get('clan',       '—'),
+            rs.get('overall',    999),
+            rs.get('off_rank',   999),
+            rs.get('def_rank',   999),
+        ))
+    if rank_snap_extra:
+        print(f"  ℹ️  {len(rank_snap_extra)} additional players injected from rankings snapshot")
+    extra_players.extend(rank_snap_extra)
+
     print(f'\n{"="*150}')
     print(f'  PLAYER ESTIMATES — {ts}  (gear tiers from exact armory data)')
     print(f'{"="*150}')
@@ -4240,8 +4267,14 @@ def estimator_run():
 
     # Gear tier explanation
     your_lv = you.get('level', 2)
-    tier_rows = [(2,'T1 unit + T3 gear'),(10,'T2 unit + T5 gear'),
-                 (13,'T3 unit + T7 gear'),(16,'T4 unit + T9 gear'),(18,'T4 unit + T10 gear')]
+    # Level thresholds match est_armory_lv / est_fort_lv gates:
+    #   Lv < 10  → Armory/Fort Lv0 → T3 gear
+    #   Lv 10-29 → Armory/Fort Lv1 → T5 gear  (CONFIRMED: Armory Lv2 req. Player Lv30)
+    #   Lv 30-49 → Armory/Fort Lv2 → T7 gear  (user confirmed T6+T7 opens at Lv30)
+    #   Lv 50-69 → Armory/Fort Lv3 → T9 gear  (estimated)
+    #   Lv 70+   → Armory/Fort Lv4 → T10 gear (estimated)
+    tier_rows = [(2, 'T1 unit + T3 gear'), (10, 'T2 unit + T5 gear'),
+                 (30, 'T3 unit + T7 gear'), (50, 'T4 unit + T9 gear'), (70, 'T4 unit + T10 gear')]
     print(f'\n  GEAR TIER SUMMARY (stat per fully-geared unit):')
     for lv, label in tier_rows:
         you_tag = '  ← YOU' if lv <= your_lv < (tier_rows[tier_rows.index((lv,label))+1][0]
