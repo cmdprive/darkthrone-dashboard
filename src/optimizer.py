@@ -397,34 +397,83 @@ def read_state(page):
     s["upgrades_owned"]   = upg_js["owned"]
     s["upgrades_buyable"] = upg_js["buyable"]
 
-    # ── 5. BUILDINGS — all building levels via DOM ────────────────────────────
+    # ── 5. BUILDINGS — all building levels + upgradability via DOM ────────────
+    # Scrape the /buildings page and extract per-card:
+    #   • level / max (from `.status-value` text "N / M")
+    #   • locked / upgradable / needs-gold (from card CSS classes — the game
+    #     itself computes whether player-level / prereq / gold requirements
+    #     are met and reflects it in the class list)
+    #   • cost (from the `data-full` attribute on `.abbreviated-number` —
+    #     exact integer, not the "75.00M" display format)
+    #   • requirements text (for logging / dashboard display)
+    #
+    # This avoids hardcoded per-level gate tables: we trust the game's own
+    # "upgradable" / "locked" signal instead of maintaining est_mine_lv() /
+    # est_armory_lv() / etc.
     page.goto(f"{BASE_URL}/buildings")
     page.wait_for_load_state("networkidle", timeout=10000)
-    bldg_js = page.evaluate("""() => {
+    bldg_js = page.evaluate(r"""() => {
         const result = {};
         document.querySelectorAll('input[name="building_type_id"]').forEach(inp => {
-            const id  = parseInt(inp.value);
-            // Walk up the DOM to find the card containing the status-value
-            let el = inp.parentElement;
-            for (let i = 0; i < 8 && el; i++) {
-                const sv = el.querySelector('.status-value');
-                if (sv) {
-                    const m = sv.innerText.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
-                    if (m) { result[id] = {level: parseInt(m[1]), max: parseInt(m[2])}; break; }
-                }
-                el = el.parentElement;
+            const id = parseInt(inp.value);
+            const form = inp.closest('form');
+            let card = inp.parentElement;
+            for (let i = 0; i < 10 && card; i++) {
+                if (card.classList && card.classList.contains('building-card')) break;
+                card = card.parentElement;
             }
+            if (!card) return;
+            // Level / max
+            let level = 0, max = 0;
+            const sv = card.querySelector('.status-value');
+            if (sv) {
+                const m = sv.innerText.match(/(\d+)\s*\/\s*(\d+)/);
+                if (m) { level = parseInt(m[1]); max = parseInt(m[2]); }
+            }
+            // Upgrade eligibility from card class list
+            const cls = card.className || '';
+            const locked      = cls.includes('locked');
+            const upgradable  = cls.includes('upgradable');
+            const needs_gold  = cls.includes('needs-gold');
+            // Exact cost from data-full attribute
+            let cost = 0;
+            const full = card.querySelector('.abbreviated-number[data-full]');
+            if (full) {
+                const raw = (full.getAttribute('data-full') || '').replace(/,/g, '');
+                cost = parseInt(raw) || 0;
+            }
+            // Requirements text (for display)
+            const reqs = Array.from(card.querySelectorAll('.req-item'))
+                .map(e => (e.innerText || '').trim())
+                .filter(Boolean);
+            // Submit button disabled state (belt-and-braces)
+            const btn = form ? form.querySelector('button[type="submit"]') : null;
+            const disabled = btn ? (btn.disabled || btn.classList.contains('disabled')) : true;
+            result[id] = {level, max, locked, upgradable, needs_gold,
+                          cost, reqs, disabled};
         });
         return result;
     }""")
     # BUILDING_TYPE_ID is {name: int_id} (line ~1310).  Invert to {int_id: name}
     # so we can resolve the scraper's string-keyed id dict back to names.
     id_to_bname = {v: k for k, v in BUILDING_TYPE_ID.items()}
-    s["buildings"] = {}
+    s["buildings"]      = {}
+    s["buildings_meta"] = {}
     for id_str, info in bldg_js.items():
         bname = id_to_bname.get(int(id_str))
-        if bname:
-            s["buildings"][bname] = info["level"]
+        if not bname:
+            continue
+        s["buildings"][bname]      = info["level"]
+        s["buildings_meta"][bname] = {
+            "level":      info["level"],
+            "max":        info["max"],
+            "locked":     bool(info["locked"]),
+            "upgradable": bool(info["upgradable"]),
+            "needs_gold": bool(info["needs_gold"]),
+            "cost":       int(info["cost"]),
+            "reqs":       info["reqs"],
+            "disabled":   bool(info["disabled"]),
+        }
     # Fallbacks from overview text (in case DOM scrape missed something)
     if not s["buildings"].get("Mine") and s.get("mine_lv"):
         s["buildings"]["Mine"] = s["mine_lv"]
@@ -925,9 +974,22 @@ def _max_building_lv_at_player_lv(bname, player_lv):
 
 
 def _gen_build_options(state):
-    """One option per eligible building-level upgrade."""
+    """One option per eligible building-level upgrade.
+
+    Upgrade eligibility is determined in this priority order:
+      1. state['buildings_meta'][name]['upgradable'] from the live scrape.
+         This is the authoritative signal — the game computes the class
+         list from every possible gate (player level, prereq building,
+         gold availability, etc.) so we trust it over any local estimate.
+         We still generate options when `needs_gold` is True because the
+         greedy planner will handle affordability across ticks.
+      2. Fallback to est_*_lv() gates + BUILDINGS.req_lv when
+         buildings_meta is missing (e.g., in unit tests or when the
+         scraper failed to populate it).
+    """
     out = []
     builds   = state.get("buildings", {})
+    meta_all = state.get("buildings_meta", {})
     level    = state.get("level", 1)
     workers  = state.get("workers", 0)
     income   = state.get("income", 0)
@@ -935,26 +997,35 @@ def _gen_build_options(state):
 
     for bname, req_lv, base_cost, max_lv, btype in BUILDINGS:
         cur_lv = builds.get(bname, 0)
+        meta   = meta_all.get(bname)
+
         # Absolute ceiling from the BUILDINGS table (e.g., Mine maxes at Lv5).
         if cur_lv >= max_lv:
             continue
-        # Initial-build player-level gate (e.g., Mine needs player Lv3 before
-        # you can build Lv1 at all).
-        if level < req_lv:
-            continue
-        # PER-LEVEL player-level gate: Armory Lv2 needs player Lv30, Fort Lv2
-        # needs Lv20, Mine Lv2 needs Lv12, etc.  Without this check we'd
-        # propose upgrades the server rejects with a disabled-button error,
-        # wasting a slot in the 12-action budget.
-        reachable = _max_building_lv_at_player_lv(bname, level)
-        if (cur_lv + 1) > reachable:
-            continue
-        # Dependency prereq (e.g., Mine Lv2 needs Fortification Lv1 already built)
-        prereq = BUILDING_PREREQ.get((bname, cur_lv + 1), {})
-        if any(builds.get(b, 0) < req for b, req in prereq.items()):
-            continue
 
-        cost = base_cost * (cur_lv + 1)
+        if meta is not None:
+            # LIVE-SCRAPE path: trust the game's upgradable flag.
+            # 'locked' means the server has decided the level or prereq
+            # requirements aren't met — skip entirely, don't waste a slot.
+            if meta.get("locked"):
+                continue
+            if not meta.get("upgradable"):
+                continue
+            # 'needs_gold' is fine — we still propose the option and let
+            # the greedy loop decide when to spend on it.
+        else:
+            # FALLBACK path (buildings_meta missing): old level-gate logic.
+            if level < req_lv:
+                continue
+            reachable = _max_building_lv_at_player_lv(bname, level)
+            if (cur_lv + 1) > reachable:
+                continue
+            prereq = BUILDING_PREREQ.get((bname, cur_lv + 1), {})
+            if any(builds.get(b, 0) < req for b, req in prereq.items()):
+                continue
+
+        # Exact cost from the scrape, or formula if scrape didn't provide it.
+        cost = (meta.get("cost", 0) if meta else 0) or base_cost * (cur_lv + 1)
         benefits = {"income_delta": 0, "atk_delta": 0, "def_delta": 0, "xp_delta": 0}
 
         if bname == "Mine":
