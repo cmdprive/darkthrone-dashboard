@@ -3009,8 +3009,8 @@ TICKS        = 48
 # Models are pre-seeded from CONFIRMED data and re-calibrated at runtime
 # whenever profiles have been scraped and ranks are known.
 #
-# ATK — Ashcipher(off_rank=1,ATK=76408) + Mungus(off_rank=6,ATK=49041)
-#   k = ln(76408/49041)/5 = 0.0885   A = 76408/exp(-0.0885) ≈ 83,484
+# ATK — seed from Ashcipher(off_rank=1,ATK=76408); dynamically recalibrated each
+#   tick using confirmed player anchors (Mungus ATK=323975 @2026-04-15, etc.)
 ATK_RANK_A = 83_484.0
 ATK_RANK_K = 0.0885
 
@@ -3282,10 +3282,16 @@ CONFIRMED_STATS = {
         'atk': 76_408, 'def': 41_965, 'spy_off': 162,   'spy_def': 445,
         'gold': 980_667, 'bank': 1_720_000, 'citizens_idle': 332,
     },
+    # verified from in-game profile screenshot 2026-04-15
     'Mungus': {
-        'level': 21, 'race': 'Undead', 'cls': 'Thief',
-        'atk': 49_041, 'def':  5_720, 'spy_off':  90,   'spy_def':  70,
-        'gold':  21_370, 'bank': 1_800_000, 'citizens_idle': 49,
+        'level': 30, 'race': 'Undead', 'cls': 'Thief',
+        'atk': 323_975, 'def': 96_973, 'spy_off': 210, 'spy_def': 910,
+    },
+    # verified from in-game profile screenshot 2026-04-15
+    'Mettalica': {
+        'level': 27, 'race': 'Goblin', 'cls': 'Cleric',
+        'atk': 239_492, 'def': 38_442, 'spy_off': 26_130, 'spy_def': 22_880,
+        'gold': 28_797, 'bank': 14_050_000, 'citizens_idle': 16,
     },
     'JT': {
         'level': 15, 'race': 'Goblin', 'cls': 'Thief',
@@ -3319,7 +3325,8 @@ PLAYERS = [
     ('Carrot',                     21,'Elf',    'Cleric',  2688,'—',    99, 99, 99),
     ('NapoleonBorntoparty',        13,'Goblin', 'Thief',   2500,'TGO',  99, 99, 99),
     ('Hesiana',                    18,'—',      '—',       2500,'—',    99, 99, 99),
-    ('Mungus',                     21,'Undead', 'Thief',   2556,'RQUM', 99, 99, 99),
+    ('Mungus',                     30,'Undead', 'Thief',   2556,'RQUM', 99, 99, 99),
+    ('Mettalica',                  27,'Goblin', 'Cleric',  2500,'—',    99, 99, 99),
     ('flavio_2121',                13,'Undead', 'Fighter', 2500,'TGO',  99, 99, 99),
     ('CtrlAltDefeat',              13,'Elf',    'Fighter', 2400,'—',    99, 99, 99),
     ('Harley',                     19,'—',      '—',       2500,'TGO',  99, 99, 99),
