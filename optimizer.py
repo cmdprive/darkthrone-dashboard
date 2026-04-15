@@ -2126,6 +2126,7 @@ def scrape_attack_candidates(page, max_pages: int = 20) -> list:
                 "is_friend":    is_friend,
                 "is_hitlist":   is_hitlist,
                 "attack_count": attack_count,
+                "list_page":    page_num,   # which attack-list page the form lives on
             })
 
         fp = ",".join(page_names)
@@ -2215,11 +2216,17 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
 
 
 # ── Action executors ─────────────────────────────────────────────────────────
-def _submit_attack_form(page, player_id: str, turns: int) -> None:
+def _submit_attack_form(page, player_id: str, turns: int) -> dict:
     """Submit the hidden <form id='attack-form-{id}'> via page.evaluate.
     Sets the turns input value, dispatches input/change events (so any JS
     listeners run), asserts the honeypot input is empty, then calls
-    form.submit() which posts natively with cookies + _token intact."""
+    form.submit() which posts natively with cookies + _token intact.
+
+    Returns the JS result dict: {ok: bool, err?: str}.  Caller decides
+    whether a failure is transient (skip target) or fatal (BattleStop).
+    The only fatal case here is honeypot_filled — that means the page has
+    a bot-detection script filling the field, which we must never submit.
+    """
     js = r"""
     (args) => {
         const form = document.getElementById('attack-form-' + args.pid);
@@ -2236,14 +2243,17 @@ def _submit_attack_form(page, player_id: str, turns: int) -> None:
     }
     """
     result = page.evaluate(js, {"pid": str(player_id), "turns": int(turns)})
-    if not result.get("ok"):
-        raise BattleStop("error", f"submit_attack:{result.get('err','unknown')}")
+    if not result.get("ok") and result.get("err") == "honeypot_filled":
+        # Bot-detection script is filling the honeypot — refuse to submit.
+        raise BattleStop("error", "honeypot_filled")
+    return result
 
 
-def _submit_spy_form(page, player_id: str) -> None:
+def _submit_spy_form(page, player_id: str) -> dict:
     """Submit the spy recon form by clicking its button via page.evaluate.
     The spy page has one <form action='/game/spy/{id}'> per target — we find
-    it by action URL and call form.submit()."""
+    it by action URL and call form.submit().  Returns the JS result dict;
+    caller handles transient failures."""
     js = r"""
     (args) => {
         const forms = document.querySelectorAll('form[action$="/spy/' + args.pid + '"]');
@@ -2258,8 +2268,9 @@ def _submit_spy_form(page, player_id: str) -> None:
     }
     """
     result = page.evaluate(js, {"pid": str(player_id)})
-    if not result.get("ok"):
-        raise BattleStop("error", f"submit_spy:{result.get('err','unknown')}")
+    if not result.get("ok") and result.get("err") == "honeypot_filled":
+        raise BattleStop("error", "honeypot_filled")
+    return result
 
 
 def _parse_battle_result(page) -> dict:
@@ -2332,17 +2343,33 @@ def _parse_battle_result(page) -> dict:
 
 def do_attack(page, target: dict, turns: int, log_fn, dry_run: bool = False) -> dict:
     """Attack target with N turns.  Returns the parse_battle_result dict."""
-    pid  = str(target["player_id"])
-    name = target["name"]
+    pid       = str(target["player_id"])
+    name      = target["name"]
+    list_page = int(target.get("list_page", 1)) or 1
+
+    # Navigate to the exact attack-list page that contains this target's
+    # form element.  Each row's <form id="attack-form-{pid}"> only exists
+    # on the page where the target is listed, so visiting page=1 blindly
+    # would miss anyone ranked lower than the first 50.
+    page.goto(f"{BASE_ATTACK_URL}?{ATTACK_PARAMS}&page={list_page}")
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+
     gold_before = read_live_header(page).get("gold", 0)
 
     if dry_run:
         log_fn(f"  [DRY] ⚔  would attack {name} (pid={pid}) with {turns} turns  (ratio {target.get('atk_ratio',0):.2f}×)", "dim")
         return {"result": "dry_run", "xp": 0, "gold_gained": 0}
 
-    # Must be on the attack list page — the attack-form is inlined there.
-    # Caller is responsible for having the list loaded.
-    _submit_attack_form(page, pid, turns)
+    sub = _submit_attack_form(page, pid, turns)
+    if not sub.get("ok"):
+        err = sub.get("err", "unknown")
+        log_fn(f"  ⚔  {name}: skipped ({err}) — target moved or exhausted", "dim")
+        _battle_log_row("attack", pid, name, turns, gold_before, gold_before,
+                        0, f"skipped_{err}")
+        return {"result": "skipped", "xp": 0, "gold_gained": 0, "err": err}
     try:
         page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
@@ -2399,7 +2426,13 @@ def do_spy(page, target: dict, log_fn, dry_run: bool = False) -> dict:
     except Exception:
         pass
 
-    _submit_spy_form(page, pid)
+    sub = _submit_spy_form(page, pid)
+    if not sub.get("ok"):
+        err = sub.get("err", "unknown")
+        log_fn(f"  🔍 {name}: skipped ({err}) — target moved or exhausted", "dim")
+        _battle_log_row("spy", pid, name, SPY_TURNS_COST, gold_before, gold_before,
+                        0, f"skipped_{err}")
+        return {"result": "skipped", "xp": 0, "gold_gained": 0, "err": err}
     try:
         page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
@@ -2514,6 +2547,7 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
                         raise BattleStop("no_targets", "filter + daily caps exhausted pool")
 
                     log_fn(f"  🎯 Pass: {len(targets)} candidate(s)", "dim")
+                    consecutive_skips = 0
 
                     for tgt in targets:
                         if stop_event.is_set():
@@ -2539,17 +2573,22 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
                                 raise BattleStop("gold", "not enough gold for spy")
 
                         if mode == "attack":
-                            # Ensure we're on the attack list page for the form.
-                            if "/game/attack" not in (page.url or ""):
-                                page.goto(f"{BASE_ATTACK_URL}?{ATTACK_PARAMS}&page=1")
-                                try: page.wait_for_load_state("networkidle", timeout=15000)
-                                except Exception: pass
+                            # do_attack navigates to the target's list_page itself.
                             res = do_attack(page, tgt, effective_turns, log_fn, dry_run=dry_run)
                         else:
                             res = do_spy(page, tgt, log_fn, dry_run=dry_run)
 
-                        actions += 1
                         r = res.get("result", "unknown")
+                        # Skipped targets (form_not_found etc.) don't count as
+                        # "actions" — re-scrape if we get too many in a row.
+                        if r == "skipped":
+                            consecutive_skips += 1
+                            if consecutive_skips >= 3:
+                                log_fn("  🔄 3 consecutive skips — re-scraping", "dim")
+                                break   # leaves inner for, outer while re-scrapes
+                            continue
+                        consecutive_skips = 0
+                        actions += 1
                         if r == "win" or r == "spy_ok":
                             wins += 1
                         elif r == "loss" or r == "spy_fail":
