@@ -2961,8 +2961,23 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
     # re-scrape loop bounces forever on stale candidates.
     session_exhausted = set()
 
+    # Seed our_stats from private_latest.json so we know our ATK / SpyOff.
+    # The GUI doesn't pass our_stats in cfg; without this seed, atk/spy_off
+    # default to 0 and every target fails the margin filter — the loop
+    # silently exits with "No safe targets left this pass" on every call.
+    _seed_stats = {}
+    try:
+        _seed_stats = load_your_stats() or {}
+    except Exception as _e:
+        log_fn(f"  ⚠️  load_your_stats failed: {_e}", "dim")
+    _base_stats = dict(cfg.get("our_stats") or {})
+    for _k in ("atk", "def", "spy_off", "spy_def"):
+        _base_stats.setdefault(_k, int(_seed_stats.get(_k, 0)))
+
     log_fn(f"⚔  Battle loop starting — mode={mode} margin={cfg.get('margin',1.2)} "
            f"turns/hit={turns_per_hit} dry={dry_run}", "battle")
+    log_fn(f"  📊 your stats: ATK={_base_stats.get('atk',0):,} "
+           f"SpyOff={_base_stats.get('spy_off',0):,}", "dim")
 
     try:
         with sync_playwright() as p:
@@ -2988,7 +3003,7 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
 
                 while not stop_event.is_set() and actions < max_total:
                     hdr = read_live_header(page)
-                    our_stats = dict(cfg.get("our_stats") or {})
+                    our_stats = dict(_base_stats)
                     our_stats["gold"]  = hdr.get("gold",  our_stats.get("gold",  0))
                     our_stats["turns"] = hdr.get("turns", our_stats.get("turns", 0))
 
