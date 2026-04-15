@@ -2483,6 +2483,11 @@ BATTLE_LONG_DELAY_MIN   = 8.0
 BATTLE_LONG_DELAY_MAX   = 15.0
 BATTLE_LONG_PAUSE_EVERY = 10
 
+# When the optimizer thread piggybacks battle during its wait phase, battle
+# exits this many seconds BEFORE the next tick time to give run_tick a clean
+# window to acquire its lock + open the browser + finish its work.
+BATTLE_TICK_BUFFER_SECONDS = 90
+
 # Regex to pull the "(N/5)" counter out of an attack-limit span or spy button.
 ATTACK_LIMIT_RE = re.compile(r"\((\d+)\s*/\s*5\)")
 SPY_LIMIT_RE    = re.compile(r"(\d+)\s*/\s*5")
@@ -3590,7 +3595,7 @@ def do_spy(page, target: dict, log_fn, dry_run: bool = False) -> dict:
 
 
 # ── Main battle loop (entry point called from GUI thread) ───────────────────
-def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
+def battle_loop(stop_event, cfg: dict, log_fn, deadline_ts=None) -> dict:
     """Run auto-attack or auto-spy until the user stops, turns/gold run out,
     the session expires, or no safe targets remain.
 
@@ -3604,6 +3609,13 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
       max_per_pass  : int (soft cap per scrape)     [20]
       max_total     : int (hard cap for whole run)  [200]
       dry_run       : bool                          [False]
+
+    deadline_ts : optional unix timestamp.  When set, the loop exits
+        cleanly as soon as time.time() >= deadline_ts.  Used by the
+        optimizer thread to piggyback battle actions during its 30-min
+        wait phase — the optimizer calls battle_loop with
+        deadline_ts = (next tick time - BATTLE_TICK_BUFFER_SECONDS) so
+        battle always hands the browser back before the next tick.
 
     log_fn(msg, tag): callback for the GUI log.  No stdout redirect is used,
     so the caller does not need to worry about capture threads."""
@@ -3619,10 +3631,13 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
     max_total     = int(cfg.get("max_total", 200))
     dry_run       = bool(cfg.get("dry_run", False))
 
-    # Refuse if the optimizer is running.
+    # Refuse if another optimizer tick is actively running (holds OPT_LOCK).
+    # The "optimizer thread is alive" case is NOT blocked here anymore —
+    # during the optimizer's wait phase it releases OPT_LOCK, so battle
+    # from within that same thread (via deadline_ts) works fine.
     if os.path.isfile(OPT_LOCK_FILE):
-        log_fn("  ❌ Optimizer appears to be running (.optimizer.lock present) — "
-               "stop it first.", "red")
+        log_fn("  ❌ Optimizer tick in progress (.optimizer.lock present) — "
+               "wait for it to finish first.", "red")
         return {"ok": False, "reason": "opt_running", "actions": 0}
 
     if not _acquire_lock(BATTLE_LOCK_FILE):
@@ -3702,6 +3717,12 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
                     log_fn(f"  ⏲  Daily reset in {hrs}h {mins}m", "dim")
 
                 while not stop_event.is_set() and actions < max_total:
+                    # Deadline check — used when the optimizer thread piggybacks
+                    # battle during its wait phase.  Exit cleanly before the
+                    # next tick time so we don't block run_tick().
+                    if deadline_ts and time.time() >= deadline_ts:
+                        raise BattleStop("deadline", "tick time approaching")
+
                     hdr = read_live_header(page)
                     our_stats = dict(_base_stats)
                     our_stats["gold"]  = hdr.get("gold",  our_stats.get("gold",  0))
@@ -3802,9 +3823,11 @@ def battle_loop(stop_event, cfg: dict, log_fn) -> dict:
                         if actions % BATTLE_LONG_PAUSE_EVERY == 0:
                             delay = _random.uniform(BATTLE_LONG_DELAY_MIN, BATTLE_LONG_DELAY_MAX)
                             log_fn(f"  💤 long pause {delay:.1f}s (every {BATTLE_LONG_PAUSE_EVERY})", "dim")
-                        # Sleep in 0.5s slices so stop_event reacts quickly.
+                        # Sleep in 0.5s slices so stop_event / deadline react quickly.
                         slept = 0.0
                         while slept < delay and not stop_event.is_set():
+                            if deadline_ts and time.time() >= deadline_ts:
+                                break
                             time.sleep(min(0.5, delay - slept))
                             slept += 0.5
                     # end inner for — loop back to re-scrape on next pass

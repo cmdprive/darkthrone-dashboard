@@ -414,10 +414,12 @@ class DarkThroneApp:
         self._battle_skip_friends = tk.BooleanVar(value=self._cfg.get("battle_skip_friends", True))
         self._battle_skip_clan    = tk.BooleanVar(value=self._cfg.get("battle_skip_clan",    True))
         self._battle_skip_bots    = tk.BooleanVar(value=self._cfg.get("battle_skip_bots",    False))
+        self._battle_during_wait  = tk.BooleanVar(value=self._cfg.get("battle_during_wait",  False))
         for var, txt in (
             (self._battle_skip_friends, "Skip friends"),
             (self._battle_skip_clan,    "Skip clanmates"),
             (self._battle_skip_bots,    "Skip bots"),
+            (self._battle_during_wait,  "Battle during optimizer wait"),
         ):
             tk.Checkbutton(
                 sb, text=txt, variable=var,
@@ -584,11 +586,16 @@ class DarkThroneApp:
         if self._opt_thread and self._opt_thread.is_alive():
             return
         if self._battle_thread and self._battle_thread.is_alive():
-            messagebox.showwarning(
-                "Auto-Battle running",
-                "Stop auto-battle before starting the optimizer — "
-                "they share the browser session.")
-            return
+            if not messagebox.askokcancel(
+                    "Auto-Battle running",
+                    "A standalone auto-battle session is active.  The "
+                    "optimizer and battle will coordinate via a lockfile "
+                    "— if a tick fires while battle is mid-action it may "
+                    "be skipped for this cycle.\n\nTip: stop the standalone "
+                    "battle and check 'Battle during optimizer wait' "
+                    "instead so the optimizer coordinates both "
+                    "automatically.\n\nProceed anyway?"):
+                return
         if not os.path.isfile(AUTH_FILE):
             messagebox.showwarning("Not logged in", "Please log in first.")
             return
@@ -634,17 +641,62 @@ class DarkThroneApp:
                 if self._opt_stop.is_set():
                     break
 
-                now  = datetime.datetime.now()
-                wait = (30 * 60) - (now.minute % 30) * 60 - now.second
-                nxt  = (now + datetime.timedelta(seconds=wait)).strftime("%H:%M")
+                now          = datetime.datetime.now()
+                wait         = (30 * 60) - (now.minute % 30) * 60 - now.second
+                next_tick_dt = now + datetime.timedelta(seconds=wait)
+                nxt          = next_tick_dt.strftime("%H:%M")
                 self._ui(self._log_write,
                          f"⏳  Next tick at {nxt}  ({wait // 60}m {wait % 60}s)\n", "dim")
                 self._ui(self._status, f"Sleeping until {nxt}…")
 
-                for _ in range(wait):
-                    if self._opt_stop.is_set():
-                        break
-                    time.sleep(1)
+                # ── Piggyback battle during the wait phase? ─────────────
+                # If the user enabled "Battle during optimizer wait", run
+                # battle_loop with a deadline = next_tick - buffer so it
+                # exits before the next tick starts.  Otherwise just sleep.
+                battle_during_wait = bool(self._battle_during_wait.get())
+                if battle_during_wait and wait > (optimizer.BATTLE_TICK_BUFFER_SECONDS + 30):
+                    deadline_ts = next_tick_dt.timestamp() - optimizer.BATTLE_TICK_BUFFER_SECONDS
+                    try:
+                        margin = float(self._battle_margin.get() or 1.2)
+                    except Exception:
+                        margin = 1.2
+                    cfg = {
+                        "mode":          self._battle_mode.get(),
+                        "margin":        max(1.0, margin),
+                        "turns_per_hit": int(self._battle_turns.get()),
+                        "skip_friends":  bool(self._battle_skip_friends.get()),
+                        "skip_clan":     bool(self._battle_skip_clan.get()),
+                        "skip_bots":     bool(self._battle_skip_bots.get()),
+                        "max_per_pass":  20,
+                        "max_total":     500,   # high cap, deadline is the real limit
+                        "scrape_pages":  10,
+                        "dry_run":       False,
+                    }
+                    self._ui(self._log_write,
+                             f"▶ Piggybacking auto-battle during wait — mode={cfg['mode']} "
+                             f"until {next_tick_dt.strftime('%H:%M')} "
+                             f"(buffer {optimizer.BATTLE_TICK_BUFFER_SECONDS}s)\n", "battle")
+                    self._ui(self._battle_lbl.config, text="● Piggyback", fg=C["green"])
+                    try:
+                        optimizer.battle_loop(self._opt_stop, cfg,
+                                              log_fn=self._battle_log,
+                                              deadline_ts=deadline_ts)
+                    except Exception as e:
+                        self._ui(self._log_write, f"❌ Piggyback battle error: {e}\n", "red")
+                    finally:
+                        self._ui(self._battle_lbl.config, text="○ Stopped", fg=C["dim"])
+                    # Sleep off any remaining time (battle exits BATTLE_TICK_BUFFER_SECONDS early)
+                    tail = int(next_tick_dt.timestamp() - time.time())
+                    for _ in range(max(0, tail)):
+                        if self._opt_stop.is_set():
+                            break
+                        time.sleep(1)
+                else:
+                    # Plain sleep — no piggyback or wait too short to be worth it.
+                    for _ in range(wait):
+                        if self._opt_stop.is_set():
+                            break
+                        time.sleep(1)
         finally:
             sys.stdout = old_out
             self._ui(self._opt_lbl.config, text="○ Stopped", fg=C["dim"])
@@ -665,6 +717,7 @@ class DarkThroneApp:
             self._cfg["battle_skip_friends"] = bool(self._battle_skip_friends.get())
             self._cfg["battle_skip_clan"]    = bool(self._battle_skip_clan.get())
             self._cfg["battle_skip_bots"]    = bool(self._battle_skip_bots.get())
+            self._cfg["battle_during_wait"]  = bool(self._battle_during_wait.get())
             self._save_config_file()
         except Exception:
             pass
@@ -679,11 +732,26 @@ class DarkThroneApp:
         if self._battle_thread and self._battle_thread.is_alive():
             return
         if self._opt_thread and self._opt_thread.is_alive():
-            messagebox.showwarning(
-                "Optimizer running",
-                "Stop the optimizer before starting auto-battle — "
-                "they share the browser session.")
-            return
+            # If the optimizer's "Battle during wait" option is enabled, the
+            # standalone Start Battle button is redundant — the piggyback is
+            # already running battle during the wait phase.  Nudge the user.
+            if bool(self._battle_during_wait.get()):
+                messagebox.showinfo(
+                    "Already piggybacking",
+                    "The optimizer is already running auto-battle during its "
+                    "wait phase ('Battle during optimizer wait' is checked). "
+                    "No need to start a separate battle session.")
+                return
+            # Otherwise: allow starting, but warn about the race risk.
+            if not messagebox.askokcancel(
+                    "Optimizer running",
+                    "The optimizer is running.  Auto-battle will share the "
+                    "browser session with the next tick via a lockfile; if "
+                    "a tick fires while battle is active, the tick will be "
+                    "skipped for this cycle.\n\nTip: enable 'Battle during "
+                    "optimizer wait' instead to let the optimizer coordinate "
+                    "both automatically.\n\nProceed anyway?"):
+                return
         if not os.path.isfile(AUTH_FILE):
             messagebox.showwarning("Not logged in", "Please log in first.")
             return
