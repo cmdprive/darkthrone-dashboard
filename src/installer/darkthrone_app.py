@@ -37,34 +37,47 @@ Requirements:  pip install playwright && playwright install chromium
 # doesn't require any edits inside optimizer.py itself.
 import os as _os, sys as _sys, shutil as _shutil
 if getattr(_sys, "frozen", False):
-    _exe_dir    = _os.path.dirname(_sys.executable)              # release/DarkThrone Suite/
-    _darkthrone = _os.path.dirname(_os.path.dirname(_exe_dir))   # darkthrone/
-    _src_dir    = _os.path.join(_darkthrone, "src")
+    # Installed / frozen build — ALWAYS use per-user AppData. The exe
+    # may live in Program Files (read-only for non-admins) so we can't
+    # write next to it. %LOCALAPPDATA% is a standard per-user writable
+    # location that survives uninstall + reinstall (keeps auth.json).
+    _exe_dir    = _os.path.dirname(_sys.executable)
+    _DATA_DIR   = _os.path.join(
+        _os.environ.get("LOCALAPPDATA") or _os.path.expanduser("~"),
+        "DarkThroneSuite",
+    )
+    _src_dir    = ""   # no source dir at runtime; modules come from _internal/
 else:
+    # Dev / source mode — portable data/ next to the repo as before.
     _here       = _os.path.dirname(_os.path.abspath(__file__))   # src/installer/
     _src_dir    = _os.path.dirname(_here)                        # src/
     _darkthrone = _os.path.dirname(_src_dir)                     # darkthrone/
     _exe_dir    = ""
+    _DATA_DIR   = _os.path.join(_darkthrone, "data")
 
-_DATA_DIR = _os.path.join(_darkthrone, "data")
 _os.makedirs(_DATA_DIR, exist_ok=True)
 _os.chdir(_DATA_DIR)
 
-# Bootstrap dashboard template: if data/index.html doesn't exist yet, seed
-# it from the template shipped alongside the source (or bundled with the exe).
+# Bootstrap dashboard template: if index.html doesn't exist yet in the
+# data dir, seed it from the template shipped with the source or bundled
+# alongside the exe (src/index.html is copied into the release root).
 _dashboard_out = _os.path.join(_DATA_DIR, "index.html")
 if not _os.path.isfile(_dashboard_out):
-    for _tpl in (_os.path.join(_src_dir, "index.html"),
-                 _os.path.join(_exe_dir, "index.html") if _exe_dir else ""):
-        if _tpl and _os.path.isfile(_tpl):
-            try:    _shutil.copy2(_tpl, _dashboard_out)
-            except Exception: pass
+    _candidates = []
+    if _src_dir: _candidates.append(_os.path.join(_src_dir, "index.html"))
+    if _exe_dir: _candidates.append(_os.path.join(_exe_dir, "index.html"))
+    for _tpl in _candidates:
+        if _os.path.isfile(_tpl):
+            try:
+                _shutil.copy2(_tpl, _dashboard_out)
+            except Exception as _e:
+                print(f"⚠️  dashboard template copy failed: {_e}")
             break
 
 # So `import optimizer` finds the source module when running as .py.
 # (The frozen exe has optimizer.pyc bundled in _internal/; this insert is a
 # no-op there but harmless.)
-if _src_dir not in _sys.path:
+if _src_dir and _src_dir not in _sys.path:
     _sys.path.insert(0, _src_dir)
 _ROOT = _DATA_DIR   # backward-compat alias for anything downstream
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,6 +118,18 @@ import time
 import io
 import webbrowser
 
+# Version info — imported from src/_version.py (bundled with the exe via
+# PyInstaller). Fallback defaults keep the app runnable during dev even if
+# the module lookup fails for some reason.
+try:
+    from _version import __version__, __update_repo__
+except ImportError:
+    __version__ = "dev"
+    __update_repo__ = "cmdprive/darkthrone-suite"
+
+# Auto-updater — lazy-imported in __init__ so an import failure doesn't
+# block the GUI from launching.
+
 def _unhide_file(path):
     """Remove hidden/read-only Windows attribute so the file can be written."""
     if sys.platform == "win32" and os.path.isfile(path):
@@ -144,20 +169,35 @@ _LEGACY_STRAT_MAP = {
 }
 
 C = {                         # colour palette
-    "bg":      "#0d0d0d",
-    "card":    "#161616",
-    "border":  "#252525",
-    "text":    "#cccccc",
-    "dim":     "#555555",
-    "gold":    "#e8c96d",
-    "green":   "#5dba6f",
-    "red":     "#d95f5f",
-    "blue":    "#5090d0",
-    "orange":  "#d08050",
-    "btn":     "#222222",
-    "btn_act": "#2e2e2e",
-    "log_bg":  "#0a0a0a",
+    "bg":       "#0f0f14",
+    "card":     "#1a1a24",
+    "card_alt": "#14141e",
+    "border":   "#2a2a3a",
+    "text":     "#e0e0e0",
+    "dim":      "#666680",
+    "gold":     "#ffd700",
+    "green":    "#44cc66",
+    "red":      "#ff5555",
+    "blue":     "#5599ff",
+    "orange":   "#ff9933",
+    "cyan":     "#00e5ff",
+    "purple":   "#bb77ff",
+    "btn":      "#252535",
+    "btn_act":  "#353545",
+    "log_bg":   "#0a0a10",
 }
+
+
+def _fmt_num(n):
+    """Format a number with k/M suffix for the player card."""
+    if n is None:
+        return "—"
+    n = int(n)
+    if abs(n) >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if abs(n) >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
 
 # ─────────────────────────────────────────────────────────────────────────────
 class _Capture(io.StringIO):
@@ -178,9 +218,9 @@ class _Capture(io.StringIO):
 class DarkThroneApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("DarkThrone Suite")
-        self.root.geometry("980x720")
-        self.root.minsize(900, 520)
+        self.root.title(f"DarkThrone Suite  v{__version__}")
+        self.root.geometry("1400x900")
+        self.root.minsize(1200, 700)
         self.root.configure(bg=C["bg"])
 
         self._cfg        = self._load_config()
@@ -191,9 +231,20 @@ class DarkThroneApp:
         self._battle_stop   = threading.Event()
         self._battle_thread = None
 
+        # Settings vars (used by _save_settings, created before UI so
+        # they exist even before the settings popup is opened)
+        self._race_var  = tk.StringVar(value=self._cfg.get("race", "Human"))
+        self._class_var = tk.StringVar(value=self._cfg.get("class", "Fighter"))
+
+        # Update-banner state — populated when a newer release is found
+        # on GitHub. Widgets created in _build_ui().
+        self._update_pending = None   # dict(version, url, notes) or None
+
         self._build_ui()
         self._check_auth()
+        self._update_player_card()      # load existing stats on startup
         self._first_run_warning()
+        self._start_update_check()
 
     # ── Config ────────────────────────────────────────────────────────────────
     def _load_config(self):
@@ -245,6 +296,84 @@ class DarkThroneApp:
             self._cfg["_warned"] = True
             self._save_config_file()
 
+    # ── Auto-updater ──────────────────────────────────────────────────────────
+    def _start_update_check(self):
+        """Kick off the background GitHub-Releases check.  If a newer
+        release is found, `_show_update_banner` is called via after() to
+        bounce back onto the UI thread safely."""
+        try:
+            from updater import check_for_update
+        except ImportError as e:
+            print(f"  ⚠️  updater module unavailable: {e}")
+            return
+
+        def _available(version, url, notes):
+            # Called from worker thread — marshal to UI via after()
+            self.root.after(0, lambda: self._show_update_banner(version, url, notes))
+
+        check_for_update(_available)
+
+    def _show_update_banner(self, version, url, notes):
+        """Reveal the update-available banner at the top of the window."""
+        if getattr(self, "_update_pending", None):
+            return   # banner already showing (don't stomp ongoing download)
+        self._update_pending = {"version": version, "url": url, "notes": notes}
+        self._update_msg.config(
+            text=f"\u2b06  Update available: v{version}  —  click Update now to install.")
+        # Pack AFTER the header but BEFORE the separator. We know the
+        # separator is currently the 2nd child; insert banner before it.
+        self._update_banner.pack(fill="x", padx=12, pady=(0, 6),
+                                 before=self.root.pack_slaves()[1])
+
+    def _dismiss_update(self):
+        """Hide the banner; user can still update next launch."""
+        try:
+            self._update_banner.pack_forget()
+        except Exception:
+            pass
+
+    def _do_update(self):
+        """Start the download + install flow."""
+        if not getattr(self, "_update_pending", None):
+            return
+        url = self._update_pending["url"]
+        ver = self._update_pending["version"]
+
+        # Confirm with user
+        if not messagebox.askokcancel(
+                "Install update?",
+                f"DarkThrone Suite v{ver} will be downloaded and installed.\n\n"
+                f"The current app will close during installation and\n"
+                f"relaunch automatically afterwards.\n\n"
+                f"Continue?"):
+            return
+
+        try:
+            from updater import download_and_launch
+        except ImportError as e:
+            messagebox.showerror("Update error", f"Updater unavailable: {e}")
+            return
+
+        # Disable button + show progress
+        self._update_btn.config(text="Downloading…", state="disabled")
+        self._update_msg.config(text=f"\u2b07  Downloading v{ver}…  0%")
+
+        def _progress(pct, done, total):
+            # Marshal to UI thread
+            self.root.after(0, lambda: self._update_msg.config(
+                text=f"\u2b07  Downloading v{ver}…  {pct:.0f}%  ({done//1024//1024} / {total//1024//1024} MB)"))
+
+        def _error(e):
+            self.root.after(0, lambda: messagebox.showerror(
+                "Update failed",
+                f"Could not install the update: {e}\n\n"
+                f"Please download the new version manually from:\n"
+                f"https://github.com/{__update_repo__}/releases/latest"))
+            self.root.after(0, lambda: self._update_btn.config(
+                text="\u25bc Update now", state="normal"))
+
+        download_and_launch(url, progress_cb=_progress, on_error=_error)
+
     # ── Auth ──────────────────────────────────────────────────────────────────
     def _check_auth(self):
         if os.path.isfile(AUTH_FILE):
@@ -261,209 +390,106 @@ class DarkThroneApp:
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        # Header
+        # ── Header bar ───────────────────────────────────────────────────
         hdr = tk.Frame(self.root, bg=C["bg"])
-        hdr.pack(fill="x", padx=18, pady=(14, 8))
-        tk.Label(hdr, text="🛡️  DarkThrone Suite",
+        hdr.pack(fill="x", padx=18, pady=(10, 6))
+        tk.Label(hdr, text="\U0001f3f0  DarkThrone Suite",
                  bg=C["bg"], fg=C["gold"],
-                 font=("Segoe UI", 15, "bold")).pack(side="left")
-        tk.Label(hdr, text="automated optimizer & dashboard",
+                 font=("Segoe UI", 14, "bold")).pack(side="left")
+        tk.Label(hdr, text="automated optimizer & battle dashboard",
                  bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(side="left", padx=(10, 0), pady=3)
+                 font=("Segoe UI", 8)).pack(side="left", padx=(10, 0), pady=3)
+
+        # Quick-access icons: chart + dashboard + settings (top-right)
+        tk.Button(hdr, text="\u2699", command=self._open_settings_popup,
+                  bg=C["bg"], fg=C["dim"], relief="flat", bd=0,
+                  font=("Segoe UI", 14), cursor="hand2",
+                  activebackground=C["bg"], activeforeground=C["gold"]).pack(
+                      side="right", padx=(4, 0))
+        tk.Button(hdr, text="\U0001f310", command=self._open_dash,
+                  bg=C["bg"], fg=C["dim"], relief="flat", bd=0,
+                  font=("Segoe UI", 12), cursor="hand2",
+                  activebackground=C["bg"], activeforeground=C["gold"]).pack(
+                      side="right", padx=(4, 0))
+        tk.Button(hdr, text="\U0001f4c8", command=self._open_chart,
+                  bg=C["bg"], fg=C["dim"], relief="flat", bd=0,
+                  font=("Segoe UI", 12), cursor="hand2",
+                  activebackground=C["bg"], activeforeground=C["gold"]).pack(
+                      side="right", padx=(4, 0))
+
+        # Update banner (hidden until an update is found on GitHub Releases)
+        self._update_banner = tk.Frame(
+            self.root, bg="#2d1f00",
+            highlightbackground=C["gold"], highlightthickness=1,
+        )
+        # Intentionally NOT packed yet — `_show_update_banner()` packs it
+        # when an update is actually available.
+        self._update_msg = tk.Label(
+            self._update_banner, text="", bg="#2d1f00", fg=C["gold"],
+            font=("Segoe UI", 9, "bold"), padx=14, pady=6, anchor="w")
+        self._update_msg.pack(side="left", fill="x", expand=True)
+        self._update_btn = tk.Button(
+            self._update_banner, text="\u25bc Update now",
+            command=self._do_update, bg=C["gold"], fg="#000000",
+            activebackground="#ffe680", activeforeground="#000000",
+            relief="flat", bd=0, pady=3, padx=12,
+            font=("Segoe UI", 9, "bold"), cursor="hand2")
+        self._update_btn.pack(side="right", padx=(6, 10), pady=4)
+        tk.Button(
+            self._update_banner, text="\u2715",
+            command=self._dismiss_update, bg="#2d1f00", fg=C["dim"],
+            activebackground="#2d1f00", activeforeground=C["text"],
+            relief="flat", bd=0, font=("Segoe UI", 10), cursor="hand2").pack(
+                side="right", padx=(0, 6))
 
         # Separator
         tk.Frame(self.root, bg=C["border"], height=1).pack(fill="x")
 
-        # Body: sidebar + log
+        # ── Status bar (packed FIRST so it sits at very bottom) ──────────
+        self._statusbar = tk.Label(
+            self.root, text="Ready.",
+            bg=C["border"], fg=C["dim"],
+            font=("Segoe UI", 8), anchor="w", padx=10, pady=3)
+        self._statusbar.pack(fill="x", side="bottom")
+
+        # ── Body: left column (player card + tabs) | right (activity log)
         body = tk.Frame(self.root, bg=C["bg"])
-        body.pack(fill="both", expand=True, padx=18, pady=14)
+        body.pack(fill="both", expand=True, padx=12, pady=10)
 
-        # ── Scrollable sidebar ───────────────────────────────────────────
-        # The sidebar has more content than a 720px window can show on
-        # short laptop screens, so wrap it in a Canvas + Scrollbar.  The
-        # inner `sb` frame is what every _section / _button / etc. packs
-        # into, exactly as before — the scroll rig is transparent.
-        sb_outer = tk.Frame(body, bg=C["bg"], width=226)
-        sb_outer.pack(side="left", fill="y", padx=(0, 14))
-        sb_outer.pack_propagate(False)
+        # ── LEFT COLUMN — Player Card on top, Tabs below ────────────────
+        left_col = tk.Frame(body, bg=C["bg"], width=300)
+        left_col.pack(side="left", fill="y", padx=(0, 8))
+        left_col.pack_propagate(False)
 
-        sb_canvas = tk.Canvas(
-            sb_outer, bg=C["bg"], highlightthickness=0, bd=0, width=210)
-        sb_scroll = tk.Scrollbar(
-            sb_outer, orient="vertical", command=sb_canvas.yview,
-            bg=C["bg"], troughcolor=C["card"], activebackground=C["border"],
-            highlightthickness=0, bd=0, width=10)
-        sb_canvas.configure(yscrollcommand=sb_scroll.set)
-        sb_scroll.pack(side="right", fill="y")
-        sb_canvas.pack(side="left", fill="both", expand=True)
+        # Player card (top of left column)
+        card = tk.Frame(left_col, bg=C["card"],
+                        highlightbackground=C["border"], highlightthickness=1)
+        card.pack(fill="x", pady=(0, 6))
+        self._build_player_card(card)
 
-        sb = tk.Frame(sb_canvas, bg=C["bg"])
-        sb_window = sb_canvas.create_window((0, 0), window=sb, anchor="nw")
+        # Tabbed controls (bottom of left column, fills remaining height)
+        nb = ttk.Notebook(left_col, style="Dark.TNotebook")
+        nb.pack(fill="both", expand=True)
 
-        def _sb_configure(event=None):
-            sb_canvas.configure(scrollregion=sb_canvas.bbox("all"))
-            # Keep the inner frame width synced to the canvas width so
-            # long labels don't wrap oddly or get clipped horizontally.
-            sb_canvas.itemconfig(sb_window, width=sb_canvas.winfo_width())
-        sb.bind("<Configure>",        _sb_configure)
-        sb_canvas.bind("<Configure>", _sb_configure)
+        opt_tab    = tk.Frame(nb, bg=C["card"])
+        battle_tab = tk.Frame(nb, bg=C["card"])
+        nb.add(opt_tab,      text="Optimizer")
+        nb.add(battle_tab,   text="Battle")
 
-        # Mousewheel only scrolls when the cursor is over the sidebar so
-        # the log widget keeps its own scroll behavior.
-        def _sb_wheel(event):
-            sb_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        def _sb_wheel_bind(e):   sb_canvas.bind_all("<MouseWheel>", _sb_wheel)
-        def _sb_wheel_unbind(e): sb_canvas.unbind_all("<MouseWheel>")
-        sb_canvas.bind("<Enter>", _sb_wheel_bind)
-        sb_canvas.bind("<Leave>", _sb_wheel_unbind)
-        sb.bind("<Enter>",        _sb_wheel_bind)
-        sb.bind("<Leave>",        _sb_wheel_unbind)
+        self._build_optimizer_tab(opt_tab)
+        self._build_battle_tab(battle_tab)
 
-        # ACCOUNT
-        self._section(sb, "ACCOUNT")
-        self._auth_lbl = self._label(sb, "○ Checking…", C["dim"])
-        self._auth_lbl.pack(anchor="w", padx=4, pady=(0, 4))
-        self._button(sb, "🔑  Login with Browser", self._do_login)
-
-        self._divider(sb)
-
-        # STRATEGY
-        self._section(sb, "STRATEGY")
-        self._strat_var = tk.StringVar(value=self._cfg.get("strategy", "balanced"))
-        self._strat_desc_lbl = tk.Label(
-            sb, text="", bg=C["bg"], fg=C["dim"],
-            font=("Segoe UI", 7), anchor="w", wraplength=190, justify="left")
-        self._strat_desc_lbl.pack(fill="x", pady=(0, 4))
-
-        strat_frame = tk.Frame(sb, bg=C["bg"])
-        strat_frame.pack(fill="x")
-        self._strat_radios = {}
-        for key, info in STRATEGY_LABELS.items():
-            rb = tk.Radiobutton(
-                strat_frame,
-                text=info["label"],
-                variable=self._strat_var,
-                value=key,
-                command=self._on_strategy_change,
-                bg=C["bg"], fg=C["text"],
-                selectcolor=C["card"],
-                activebackground=C["bg"],
-                activeforeground=C["gold"],
-                font=("Segoe UI", 9),
-                anchor="w", cursor="hand2",
-            )
-            rb.pack(fill="x", pady=1)
-            self._strat_radios[key] = rb
-        self._on_strategy_change()   # set initial description
-
-        self._divider(sb)
-
-        # OPTIMIZER
-        self._section(sb, "OPTIMIZER")
-        self._opt_lbl = self._label(sb, "○ Stopped", C["dim"])
-        self._opt_lbl.pack(anchor="w", padx=4, pady=(0, 4))
-        self._opt_start_btn = self._button(
-            sb, "▶  Start Optimizer", self._start_opt, state="disabled")
-        self._opt_stop_btn = self._button(
-            sb, "■  Stop Optimizer", self._stop_opt,
-            fg=C["dim"], state="disabled")
-
-        self._divider(sb)
-
-        # AUTO BATTLE
-        self._section(sb, "AUTO BATTLE")
-        self._battle_lbl = self._label(sb, "○ Stopped", C["dim"])
-        self._battle_lbl.pack(anchor="w", padx=4, pady=(0, 4))
-
-        # Mode radio — attack vs spy
-        self._battle_mode = tk.StringVar(value=self._cfg.get("battle_mode", "attack"))
-        mode_frame = tk.Frame(sb, bg=C["bg"])
-        mode_frame.pack(fill="x", pady=(0, 2))
-        for val, lbl in (("attack", "⚔ Attack"), ("spy", "🔍 Spy")):
-            tk.Radiobutton(
-                mode_frame, text=lbl, variable=self._battle_mode, value=val,
-                command=self._on_battle_mode_change,
-                bg=C["bg"], fg=C["text"], selectcolor=C["card"],
-                activebackground=C["bg"], activeforeground=C["gold"],
-                font=("Segoe UI", 9), anchor="w", cursor="hand2",
-            ).pack(side="left", padx=(0, 8))
-
-        # Turns per hit (1-10 spinbox)
-        tf = tk.Frame(sb, bg=C["bg"])
-        tf.pack(fill="x", pady=1)
-        tk.Label(tf, text="Turns:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 8), width=7, anchor="w").pack(side="left")
-        self._battle_turns = tk.IntVar(value=int(self._cfg.get("battle_turns", 5)))
-        tk.Spinbox(tf, from_=1, to=10, textvariable=self._battle_turns,
-                   width=4, font=("Segoe UI", 9),
-                   bg=C["card"], fg=C["text"],
-                   buttonbackground=C["btn"], relief="flat", bd=0).pack(side="left")
-
-        # Min ATK margin entry
-        mf = tk.Frame(sb, bg=C["bg"])
-        mf.pack(fill="x", pady=1)
-        tk.Label(mf, text="Margin:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 8), width=7, anchor="w").pack(side="left")
-        self._battle_margin = tk.StringVar(value=str(self._cfg.get("battle_margin", 1.2)))
-        tk.Entry(mf, textvariable=self._battle_margin, width=5,
-                 font=("Segoe UI", 9),
-                 bg=C["card"], fg=C["text"], relief="flat", bd=0,
-                 insertbackground=C["text"]).pack(side="left")
-
-        # Skip checkboxes
-        self._battle_skip_friends = tk.BooleanVar(value=self._cfg.get("battle_skip_friends", True))
-        self._battle_skip_clan    = tk.BooleanVar(value=self._cfg.get("battle_skip_clan",    True))
-        self._battle_skip_bots    = tk.BooleanVar(value=self._cfg.get("battle_skip_bots",    False))
-        self._battle_during_wait  = tk.BooleanVar(value=self._cfg.get("battle_during_wait",  False))
-        for var, txt in (
-            (self._battle_skip_friends, "Skip friends"),
-            (self._battle_skip_clan,    "Skip clanmates"),
-            (self._battle_skip_bots,    "Skip bots"),
-            (self._battle_during_wait,  "Battle during optimizer wait"),
-        ):
-            tk.Checkbutton(
-                sb, text=txt, variable=var,
-                command=self._save_battle_cfg,
-                bg=C["bg"], fg=C["text"], selectcolor=C["card"],
-                activebackground=C["bg"], activeforeground=C["gold"],
-                font=("Segoe UI", 8), anchor="w", cursor="hand2",
-            ).pack(fill="x", padx=2, pady=0)
-
-        self._battle_start_btn = self._button(
-            sb, "▶  Start Battle", self._start_battle, state="disabled")
-        self._battle_stop_btn = self._button(
-            sb, "■  Stop Battle", self._stop_battle,
-            fg=C["dim"], state="disabled")
-
-        self._divider(sb)
-
-        # DASHBOARD
-        self._section(sb, "VIEW")
-        self._button(sb, "📊  Growth Chart",      self._open_chart)
-        self._button(sb, "🌐  Public Dashboard",  self._open_dash)
-
-        self._divider(sb)
-
-        # SETTINGS
-        self._section(sb, "SETTINGS")
-        self._race_var  = self._dropdown(sb, "Race",  RACES,
-                                         self._cfg.get("race",  "Human"))
-        self._class_var = self._dropdown(sb, "Class", CLASSES,
-                                         self._cfg.get("class", "Fighter"))
-        self._button(sb, "💾  Save Settings", self._save_settings,
-                     fg=C["dim"])
-
-        # ── Log panel
+        # ── RIGHT PANEL — Activity Log (takes all remaining space) ───
         log_outer = tk.Frame(body, bg=C["card"],
                              highlightbackground=C["border"],
                              highlightthickness=1)
         log_outer.pack(side="left", fill="both", expand=True)
 
         log_hdr = tk.Frame(log_outer, bg=C["card"])
-        log_hdr.pack(fill="x", padx=10, pady=(8, 0))
-        tk.Label(log_hdr, text="📋  Activity Log",
+        log_hdr.pack(fill="x", padx=12, pady=(8, 0))
+        tk.Label(log_hdr, text="\U0001f4cb  Activity Log",
                  bg=C["card"], fg=C["dim"],
-                 font=("Segoe UI", 8, "bold")).pack(side="left")
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
         self._clear_btn = tk.Button(
             log_hdr, text="clear", command=self._clear_log,
             bg=C["card"], fg=C["dim"], relief="flat", bd=0,
@@ -475,10 +501,10 @@ class DarkThroneApp:
             log_outer,
             state="disabled", wrap="word",
             bg=C["log_bg"], fg=C["text"],
-            font=("Consolas", 9),
+            font=("Consolas", 10),
             relief="flat", bd=0,
             padx=12, pady=8,
-            selectbackground="#2a2a2a",
+            selectbackground="#2a2a3a",
         )
         self._log.pack(fill="both", expand=True, padx=6, pady=6)
 
@@ -487,70 +513,425 @@ class DarkThroneApp:
             ("gold",   C["gold"]),   ("green", C["green"]),
             ("red",    C["red"]),    ("dim",   C["dim"]),
             ("orange", C["orange"]), ("blue",  C["blue"]),
-            ("battle", "#67e8f9"),   # cyan — auto-battle activity
+            ("battle", C["cyan"]),
         ]:
             self._log.tag_config(tag, foreground=color)
-
-        # Status bar
-        self._statusbar = tk.Label(
-            self.root, text="Ready.",
-            bg=C["border"], fg=C["dim"],
-            font=("Segoe UI", 8), anchor="w", padx=10, pady=3)
-        self._statusbar.pack(fill="x", side="bottom")
 
         # Welcome message
         self._log_write(
             "Welcome to DarkThrone Suite.\n"
-            "→ Click 'Login with Browser' to authenticate your account.\n"
-            "→ Then click 'Start Optimizer' to begin.\n\n",
+            "\u2192 Click 'Login with Browser' to authenticate your account.\n"
+            "\u2192 Then click 'Start Optimizer' to begin.\n\n",
             "dim")
 
-    # ── Sidebar helpers ───────────────────────────────────────────────────────
-    def _section(self, parent, title):
-        tk.Label(parent, text=title,
-                 bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 7, "bold"),
-                 anchor="w").pack(fill="x", pady=(6, 2))
+    # ── Player Card (left panel) ─────────────────────────────────────────────
+    def _build_player_card(self, parent):
+        pad = {"padx": 14, "pady": 0}
 
-    def _divider(self, parent):
-        tk.Frame(parent, bg=C["border"], height=1).pack(
-            fill="x", pady=8)
+        # Header
+        tk.Label(parent, text="PLAYER", bg=C["card"], fg=C["gold"],
+                 font=("Segoe UI", 9, "bold"),
+                 anchor="w").pack(fill="x", padx=14, pady=(14, 6))
 
-    def _label(self, parent, text, color):
-        return tk.Label(parent, text=text,
-                        bg=C["bg"], fg=color,
-                        font=("Segoe UI", 9), anchor="w")
+        # Auth status
+        self._auth_lbl = tk.Label(
+            parent, text="\u25cb Checking\u2026", bg=C["card"], fg=C["dim"],
+            font=("Segoe UI", 9), anchor="w")
+        self._auth_lbl.pack(fill="x", **pad)
 
-    def _button(self, parent, text, cmd,
-                fg=None, state="normal", store=None):
-        btn = tk.Button(
-            parent, text=text, command=cmd,
-            bg=C["btn"], fg=fg or C["text"],
-            activebackground=C["btn_act"],
-            activeforeground=C["gold"],
-            relief="flat", bd=0,
-            pady=6, padx=8,
-            font=("Segoe UI", 9),
-            cursor="hand2",
-            state=state,
-            anchor="w",
-        )
-        btn.pack(fill="x", pady=2)
-        if store:
-            setattr(self, store, btn)
-        return btn
+        # Optimizer status
+        self._opt_lbl = tk.Label(
+            parent, text="\u25cb Optimizer stopped", bg=C["card"], fg=C["dim"],
+            font=("Segoe UI", 9), anchor="w")
+        self._opt_lbl.pack(fill="x", **pad)
 
-    def _dropdown(self, parent, label, options, default):
-        f = tk.Frame(parent, bg=C["bg"])
-        f.pack(fill="x", pady=2)
-        tk.Label(f, text=label + ":", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 8), width=6, anchor="w").pack(side="left")
-        var = tk.StringVar(value=default)
-        cb = ttk.Combobox(f, textvariable=var, values=options,
-                          state="readonly", width=11,
-                          font=("Segoe UI", 9))
-        cb.pack(side="left")
-        return var
+        # Battle status
+        self._battle_lbl = tk.Label(
+            parent, text="\u25cb Battle stopped", bg=C["card"], fg=C["dim"],
+            font=("Segoe UI", 9), anchor="w")
+        self._battle_lbl.pack(fill="x", padx=14, pady=(0, 8))
+
+        # Divider
+        tk.Frame(parent, bg=C["border"], height=1).pack(fill="x", padx=10, pady=4)
+
+        # Stat grid
+        self._stat_frame = tk.Frame(parent, bg=C["card"])
+        self._stat_frame.pack(fill="x", padx=14, pady=(4, 2))
+
+        # Level label (standalone, not a bar)
+        self._pc_level = tk.Label(
+            parent, text="Level  \u2014", bg=C["card"], fg=C["gold"],
+            font=("Segoe UI", 11, "bold"), anchor="w")
+        self._pc_level.pack(fill="x", padx=14, pady=(0, 4))
+
+        # Stat bars — placeholders created here, updated by _update_player_card
+        self._pc_bars = {}
+        stats_grid = tk.Frame(parent, bg=C["card"])
+        stats_grid.pack(fill="x", padx=14, pady=(0, 4))
+        stats_grid.columnconfigure(1, weight=1)
+        for i, (key, label, color) in enumerate([
+            ("atk",     "ATK",    C["red"]),
+            ("def",     "DEF",    C["blue"]),
+            ("spy_off", "SpyOff", C["purple"]),
+            ("spy_def", "SpyDef", C["purple"]),
+        ]):
+            tk.Label(stats_grid, text=label, bg=C["card"], fg=C["dim"],
+                     font=("Segoe UI", 9), anchor="w", width=6).grid(
+                         row=i, column=0, sticky="w", pady=1)
+            canvas = tk.Canvas(stats_grid, width=100, height=14,
+                               bg=C["card_alt"], highlightthickness=0)
+            canvas.grid(row=i, column=1, sticky="we", padx=(4, 4), pady=1)
+            val_lbl = tk.Label(stats_grid, text="\u2014", bg=C["card"],
+                               fg=C["text"], font=("Segoe UI", 10), anchor="e")
+            val_lbl.grid(row=i, column=2, sticky="e", pady=1)
+            self._pc_bars[key] = {"canvas": canvas, "val": val_lbl, "color": color}
+
+        # Divider
+        tk.Frame(parent, bg=C["border"], height=1).pack(fill="x", padx=10, pady=6)
+
+        # Gold / Income
+        self._pc_gold = tk.Label(
+            parent, text="\U0001f4b0 Gold  \u2014", bg=C["card"], fg=C["gold"],
+            font=("Segoe UI", 10), anchor="w")
+        self._pc_gold.pack(fill="x", padx=14, pady=1)
+        self._pc_income = tk.Label(
+            parent, text="\U0001f4c8 Income  \u2014 / tick", bg=C["card"], fg=C["green"],
+            font=("Segoe UI", 10), anchor="w")
+        self._pc_income.pack(fill="x", padx=14, pady=(1, 6))
+
+        # Divider
+        tk.Frame(parent, bg=C["border"], height=1).pack(fill="x", padx=10, pady=4)
+
+        # Quick-action buttons
+        btn_pad = {"fill": "x", "padx": 14, "pady": 2}
+
+        self._start_all_btn = tk.Button(
+            parent, text="\u25b6 Start All", command=self._start_all,
+            bg=C["green"], fg="#000000",
+            activebackground="#55dd77", activeforeground="#000000",
+            relief="flat", bd=0, pady=3, padx=6,
+            font=("Segoe UI", 8, "bold"), cursor="hand2")
+        self._start_all_btn.pack(**btn_pad)
+
+        self._stop_all_btn = tk.Button(
+            parent, text="\u25a0 Stop All", command=self._stop_all,
+            bg=C["red"], fg="#ffffff",
+            activebackground="#ff7777", activeforeground="#ffffff",
+            relief="flat", bd=0, pady=3, padx=6,
+            font=("Segoe UI", 8, "bold"), cursor="hand2")
+        self._stop_all_btn.pack(**btn_pad)
+
+        login_btn = tk.Button(
+            parent, text="\U0001f511 Login", command=self._do_login,
+            bg=C["btn"], fg=C["text"],
+            activebackground=C["btn_act"], activeforeground=C["gold"],
+            relief="flat", bd=0, pady=3, padx=6,
+            font=("Segoe UI", 8), cursor="hand2")
+        login_btn.pack(**btn_pad)
+
+    # ── Optimizer Tab ────────────────────────────────────────────────────────
+    def _build_optimizer_tab(self, parent):
+        pad_section = {"padx": 12, "pady": (10, 2)}
+
+        # Section header
+        tk.Label(parent, text="STRATEGY", bg=C["card"], fg=C["gold"],
+                 font=("Segoe UI", 8, "bold"), anchor="w").pack(
+                     fill="x", **pad_section)
+
+        # Strategy description (updates when radio selection changes)
+        self._strat_desc_lbl = tk.Label(
+            parent, text="", bg=C["card"], fg=C["dim"],
+            font=("Segoe UI", 7), anchor="w", wraplength=280, justify="left")
+        self._strat_desc_lbl.pack(fill="x", padx=12, pady=(0, 4))
+
+        # Strategy radios
+        self._strat_var = tk.StringVar(value=self._cfg.get("strategy", "grow"))
+        strat_frame = tk.Frame(parent, bg=C["card"])
+        strat_frame.pack(fill="x", padx=12, pady=(0, 6))
+        self._strat_radios = {}
+        for key, info in STRATEGY_LABELS.items():
+            rb = tk.Radiobutton(
+                strat_frame,
+                text=info["label"],
+                variable=self._strat_var,
+                value=key,
+                command=self._on_strategy_change,
+                bg=C["card"], fg=C["text"],
+                selectcolor=C["card_alt"],
+                activebackground=C["card"],
+                activeforeground=C["gold"],
+                font=("Segoe UI", 9),
+                anchor="w", cursor="hand2",
+            )
+            rb.pack(fill="x", pady=1)
+            self._strat_radios[key] = rb
+        self._on_strategy_change()   # set initial description
+
+        # Divider
+        tk.Frame(parent, bg=C["border"], height=1).pack(fill="x", padx=10, pady=3)
+
+        # Control buttons
+        btn_frame = tk.Frame(parent, bg=C["card"])
+        btn_frame.pack(fill="x", padx=20, pady=(10, 10))
+
+        self._opt_start_btn = tk.Button(
+            btn_frame, text="\u25b6 Start", command=self._start_opt,
+            bg=C["green"], fg="#000000",
+            activebackground="#55dd77", activeforeground="#000000",
+            relief="flat", bd=0, pady=3, padx=10,
+            font=("Segoe UI", 9, "bold"), cursor="hand2",
+            state="disabled")
+        self._opt_start_btn.pack(side="left", padx=(0, 6))
+
+        self._opt_stop_btn = tk.Button(
+            btn_frame, text="\u25a0 Stop", command=self._stop_opt,
+            bg=C["btn"], fg=C["dim"],
+            activebackground=C["btn_act"], activeforeground=C["red"],
+            relief="flat", bd=0, pady=3, padx=10,
+            font=("Segoe UI", 9), cursor="hand2",
+            state="disabled")
+        self._opt_stop_btn.pack(side="left")
+
+    # ── Battle Tab ───────────────────────────────────────────────────────────
+    def _build_battle_tab(self, parent):
+        pad = {"padx": 12}
+
+        # ---- Mode row ----
+        tk.Label(parent, text="MODE", bg=C["card"], fg=C["gold"],
+                 font=("Segoe UI", 8, "bold"), anchor="w").pack(
+                     fill="x", padx=12, pady=(10, 2))
+
+        self._battle_mode = tk.StringVar(value=self._cfg.get("battle_mode", "attack"))
+        mode_frame = tk.Frame(parent, bg=C["card"])
+        mode_frame.pack(fill="x", **pad)
+        for val, lbl in (("attack", "\u2694 Attack"), ("spy", "\U0001f50d Spy")):
+            tk.Radiobutton(
+                mode_frame, text=lbl, variable=self._battle_mode, value=val,
+                command=self._on_battle_mode_change,
+                bg=C["card"], fg=C["text"], selectcolor=C["card_alt"],
+                activebackground=C["card"], activeforeground=C["gold"],
+                font=("Segoe UI", 8), anchor="w", cursor="hand2",
+            ).pack(side="left", padx=(0, 10))
+
+        # ---- Farm mode row ----
+        tk.Label(parent, text="FARM MODE", bg=C["card"], fg=C["gold"],
+                 font=("Segoe UI", 8, "bold"), anchor="w").pack(
+                     fill="x", padx=12, pady=(6, 2))
+
+        self._battle_farm_mode = tk.StringVar(
+            value=self._cfg.get("battle_farm_mode", "gold"))
+        ff = tk.Frame(parent, bg=C["card"])
+        ff.pack(fill="x", **pad)
+        for val, lbl in (("gold", "\U0001f4b0 Gold"), ("xp", "\u2b50 XP"), ("match", "\U0001f3af Match")):
+            tk.Radiobutton(
+                ff, text=lbl, variable=self._battle_farm_mode, value=val,
+                command=self._save_battle_cfg,
+                bg=C["card"], fg=C["text"], selectcolor=C["card_alt"],
+                activebackground=C["card"], activeforeground=C["gold"],
+                font=("Segoe UI", 8), anchor="w", cursor="hand2",
+            ).pack(side="left", padx=(0, 6))
+
+        # ---- Numeric fields (grid layout — 2 rows) ----
+        fields_frame = tk.Frame(parent, bg=C["card"])
+        fields_frame.pack(fill="x", padx=12, pady=(6, 2))
+
+        # Row 0: Turns + Margin
+        tk.Label(fields_frame, text="Turns:", bg=C["card"], fg=C["dim"],
+                 font=("Segoe UI", 8), anchor="w").grid(
+                     row=0, column=0, sticky="w", pady=2)
+        self._battle_turns = tk.IntVar(value=int(self._cfg.get("battle_turns", 5)))
+        tk.Spinbox(fields_frame, from_=1, to=10, textvariable=self._battle_turns,
+                   width=4, font=("Segoe UI", 8),
+                   bg=C["card_alt"], fg=C["text"],
+                   buttonbackground=C["btn"], relief="flat", bd=1).grid(
+                       row=0, column=1, sticky="w", padx=(4, 12), pady=2)
+
+        tk.Label(fields_frame, text="Margin:", bg=C["card"], fg=C["dim"],
+                 font=("Segoe UI", 8), anchor="w").grid(
+                     row=0, column=2, sticky="w", pady=2)
+        self._battle_margin = tk.StringVar(value=str(self._cfg.get("battle_margin", 1.2)))
+        tk.Entry(fields_frame, textvariable=self._battle_margin, width=5,
+                 font=("Segoe UI", 8),
+                 bg=C["card_alt"], fg=C["text"], relief="flat", bd=1,
+                 insertbackground=C["text"]).grid(
+                     row=0, column=3, sticky="w", padx=(4, 0), pady=2)
+
+        # Row 1: Min gold
+        tk.Label(fields_frame, text="Min gold:", bg=C["card"], fg=C["dim"],
+                 font=("Segoe UI", 8), anchor="w").grid(
+                     row=1, column=0, sticky="w", pady=2)
+        self._battle_min_gold = tk.StringVar(
+            value=str(self._cfg.get("battle_min_gold", 0)))
+        tk.Entry(fields_frame, textvariable=self._battle_min_gold, width=10,
+                 font=("Segoe UI", 8),
+                 bg=C["card_alt"], fg=C["text"], relief="flat", bd=1,
+                 insertbackground=C["text"]).grid(
+                     row=1, column=1, columnspan=3, sticky="w", padx=(4, 0), pady=2)
+
+        # ---- Skip checkboxes ----
+        chk_frame = tk.Frame(parent, bg=C["card"])
+        chk_frame.pack(fill="x", padx=12, pady=(4, 2))
+
+        self._battle_skip_friends = tk.BooleanVar(value=self._cfg.get("battle_skip_friends", True))
+        self._battle_skip_clan    = tk.BooleanVar(value=self._cfg.get("battle_skip_clan",    True))
+        self._battle_skip_bots    = tk.BooleanVar(value=self._cfg.get("battle_skip_bots",    False))
+
+        for var, txt in (
+            (self._battle_skip_friends, "Skip friends"),
+            (self._battle_skip_clan,    "Skip clanmates"),
+            (self._battle_skip_bots,    "Skip bots"),
+        ):
+            tk.Checkbutton(
+                chk_frame, text=txt, variable=var,
+                command=self._save_battle_cfg,
+                bg=C["card"], fg=C["text"], selectcolor=C["card_alt"],
+                activebackground=C["card"], activeforeground=C["gold"],
+                font=("Segoe UI", 8), anchor="w", cursor="hand2",
+            ).pack(fill="x", pady=0)
+
+        # ---- Control buttons ----
+        tk.Frame(parent, bg=C["border"], height=1).pack(fill="x", padx=10, pady=3)
+
+        bbtn_frame = tk.Frame(parent, bg=C["card"])
+        bbtn_frame.pack(fill="x", padx=20, pady=(6, 10))
+
+        self._battle_start_btn = tk.Button(
+            bbtn_frame, text="\u25b6 Start", command=self._start_battle,
+            bg=C["green"], fg="#000000",
+            activebackground="#55dd77", activeforeground="#000000",
+            relief="flat", bd=0, pady=3, padx=10,
+            font=("Segoe UI", 9, "bold"), cursor="hand2",
+            state="disabled")
+        self._battle_start_btn.pack(side="left", padx=(0, 6))
+
+        self._battle_stop_btn = tk.Button(
+            bbtn_frame, text="\u25a0 Stop", command=self._stop_battle,
+            bg=C["btn"], fg=C["dim"],
+            activebackground=C["btn_act"], activeforeground=C["red"],
+            relief="flat", bd=0, pady=3, padx=10,
+            font=("Segoe UI", 9), cursor="hand2",
+            state="disabled")
+        self._battle_stop_btn.pack(side="left")
+
+    # ── Settings popup (opened via ⚙ in header) ──────────────────────────────
+    def _open_settings_popup(self):
+        """Open a small modal window for Race/Class settings."""
+        win = tk.Toplevel(self.root)
+        win.title("Settings")
+        win.configure(bg=C["card"])
+        win.geometry("300x220")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        tk.Label(win, text="CHARACTER", bg=C["card"], fg=C["gold"],
+                 font=("Segoe UI", 9, "bold"), anchor="w").pack(
+                     fill="x", padx=16, pady=(12, 6))
+
+        grid = tk.Frame(win, bg=C["card"])
+        grid.pack(fill="x", padx=16)
+
+        tk.Label(grid, text="Race:", bg=C["card"], fg=C["dim"],
+                 font=("Segoe UI", 9), anchor="w").grid(
+                     row=0, column=0, sticky="w", pady=4)
+        if not hasattr(self, "_race_var"):
+            self._race_var = tk.StringVar(value=self._cfg.get("race", "Human"))
+        race_cb = ttk.Combobox(grid, textvariable=self._race_var,
+                               values=RACES, state="readonly", width=12,
+                               font=("Segoe UI", 9))
+        race_cb.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=4)
+
+        tk.Label(grid, text="Class:", bg=C["card"], fg=C["dim"],
+                 font=("Segoe UI", 9), anchor="w").grid(
+                     row=1, column=0, sticky="w", pady=4)
+        if not hasattr(self, "_class_var"):
+            self._class_var = tk.StringVar(value=self._cfg.get("class", "Fighter"))
+        class_cb = ttk.Combobox(grid, textvariable=self._class_var,
+                                values=CLASSES, state="readonly", width=12,
+                                font=("Segoe UI", 9))
+        class_cb.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
+
+        tk.Frame(win, bg=C["border"], height=1).pack(fill="x", padx=12, pady=10)
+
+        def _save_and_close():
+            self._save_settings()
+            win.destroy()
+
+        tk.Button(win, text="\U0001f4be Save", command=_save_and_close,
+                  bg=C["btn"], fg=C["text"],
+                  activebackground=C["btn_act"], activeforeground=C["gold"],
+                  relief="flat", bd=0, pady=4, padx=12,
+                  font=("Segoe UI", 9), cursor="hand2").pack(padx=16, anchor="w")
+
+    # ── Stat bar helper ──────────────────────────────────────────────────────
+    def _stat_bar(self, parent, label, value, max_val, color, row):
+        """Draw a labeled stat bar in the player card grid."""
+        tk.Label(parent, text=label, bg=C["card"], fg=C["dim"],
+                 font=("Segoe UI", 9), anchor="w", width=6).grid(
+                     row=row, column=0, sticky="w", pady=1)
+        bar = tk.Canvas(parent, width=120, height=14,
+                        bg=C["card_alt"], highlightthickness=0)
+        bar.grid(row=row, column=1, sticky="we", padx=(4, 4), pady=1)
+        pct = min(1.0, value / max(max_val, 1))
+        bar.create_rectangle(0, 0, int(120 * pct), 14, fill=color, outline="")
+        val_lbl = tk.Label(parent, text=_fmt_num(value), bg=C["card"],
+                           fg=C["text"], font=("Segoe UI", 10), anchor="e")
+        val_lbl.grid(row=row, column=2, sticky="e", pady=1)
+
+    # ── Player card update ───────────────────────────────────────────────────
+    def _update_player_card(self, stats=None):
+        """Refresh the player-card labels from *stats* dict or
+        private_latest.json on disk."""
+        if stats is None:
+            try:
+                with open("private_latest.json", encoding="utf-8") as f:
+                    stats = json.load(f)
+            except Exception:
+                return   # no data yet — leave placeholders
+
+        # Level
+        level = stats.get("level", "?")
+        self._pc_level.config(text=f"Level  {level}")
+
+        # Stat bars — compute max for relative sizing
+        stat_keys = ["atk", "def", "spy_off", "spy_def"]
+        values = [stats.get(k, 0) for k in stat_keys]
+        max_val = max(values) if values else 1
+
+        for key in stat_keys:
+            info = self._pc_bars.get(key)
+            if not info:
+                continue
+            v = stats.get(key, 0)
+            pct = min(1.0, v / max(max_val, 1))
+            canvas = info["canvas"]
+            canvas.delete("all")
+            # Redraw after canvas has rendered so winfo_width is accurate
+            w = canvas.winfo_width() or 100
+            canvas.create_rectangle(0, 0, int(w * pct), 14,
+                                    fill=info["color"], outline="")
+            info["val"].config(text=_fmt_num(v))
+
+        # Gold / income
+        gold = stats.get("gold_on_hand", stats.get("gold", 0))
+        income = stats.get("income", 0)
+        self._pc_gold.config(text=f"\U0001f4b0 Gold  {_fmt_num(gold)}")
+        self._pc_income.config(text=f"\U0001f4c8 Income  {_fmt_num(income)} / tick")
+
+    # ── Quick actions ────────────────────────────────────────────────────────
+    def _start_all(self):
+        """Start both optimizer and battle as independent loops."""
+        self._start_opt()
+        # Only auto-start battle if authenticated — it'll silently
+        # no-op during login state.
+        if os.path.isfile(AUTH_FILE):
+            self._start_battle()
+
+    def _stop_all(self):
+        """Stop both optimizer and battle."""
+        self._stop_opt()
+        if self._battle_thread and self._battle_thread.is_alive():
+            self._stop_battle()
 
     # ── Actions ───────────────────────────────────────────────────────────────
     def _do_login(self):
@@ -623,10 +1004,19 @@ class DarkThroneApp:
         old_out = sys.stdout
         sys.stdout = _Capture(lambda msg: self._ui(self._log_write, msg + "\n"))
 
+        # next_tick_dt is set at the end of each cycle. On the second+
+        # iteration the battle phase uses it to know when to stop.
+        next_tick_dt = None
         try:
             while not self._opt_stop.is_set():
+                # ── Run the optimizer tick (SPENDS all gold on strategy)
+                # Runs right after each game tick fires. The battle loop
+                # is deliberately NOT coupled to this loop — they run as
+                # independent threads (use Start Battle separately) to
+                # keep the optimizer's gold-spending logic uncontested.
                 try:
                     optimizer.run_tick()
+                    self._ui(self._update_player_card)
                 except Exception as e:
                     self._ui(self._log_write, f"❌ Tick error: {e}\n", "red")
 
@@ -641,6 +1031,7 @@ class DarkThroneApp:
                 if self._opt_stop.is_set():
                     break
 
+                # ── Sleep until next tick ──────────────────────────────
                 now          = datetime.datetime.now()
                 wait         = (30 * 60) - (now.minute % 30) * 60 - now.second
                 next_tick_dt = now + datetime.timedelta(seconds=wait)
@@ -649,54 +1040,10 @@ class DarkThroneApp:
                          f"⏳  Next tick at {nxt}  ({wait // 60}m {wait % 60}s)\n", "dim")
                 self._ui(self._status, f"Sleeping until {nxt}…")
 
-                # ── Piggyback battle during the wait phase? ─────────────
-                # If the user enabled "Battle during optimizer wait", run
-                # battle_loop with a deadline = next_tick - buffer so it
-                # exits before the next tick starts.  Otherwise just sleep.
-                battle_during_wait = bool(self._battle_during_wait.get())
-                if battle_during_wait and wait > (optimizer.BATTLE_TICK_BUFFER_SECONDS + 30):
-                    deadline_ts = next_tick_dt.timestamp() - optimizer.BATTLE_TICK_BUFFER_SECONDS
-                    try:
-                        margin = float(self._battle_margin.get() or 1.2)
-                    except Exception:
-                        margin = 1.2
-                    cfg = {
-                        "mode":          self._battle_mode.get(),
-                        "margin":        max(1.0, margin),
-                        "turns_per_hit": int(self._battle_turns.get()),
-                        "skip_friends":  bool(self._battle_skip_friends.get()),
-                        "skip_clan":     bool(self._battle_skip_clan.get()),
-                        "skip_bots":     bool(self._battle_skip_bots.get()),
-                        "max_per_pass":  20,
-                        "max_total":     500,   # high cap, deadline is the real limit
-                        "scrape_pages":  10,
-                        "dry_run":       False,
-                    }
-                    self._ui(self._log_write,
-                             f"▶ Piggybacking auto-battle during wait — mode={cfg['mode']} "
-                             f"until {next_tick_dt.strftime('%H:%M')} "
-                             f"(buffer {optimizer.BATTLE_TICK_BUFFER_SECONDS}s)\n", "battle")
-                    self._ui(self._battle_lbl.config, text="● Piggyback", fg=C["green"])
-                    try:
-                        optimizer.battle_loop(self._opt_stop, cfg,
-                                              log_fn=self._battle_log,
-                                              deadline_ts=deadline_ts)
-                    except Exception as e:
-                        self._ui(self._log_write, f"❌ Piggyback battle error: {e}\n", "red")
-                    finally:
-                        self._ui(self._battle_lbl.config, text="○ Stopped", fg=C["dim"])
-                    # Sleep off any remaining time (battle exits BATTLE_TICK_BUFFER_SECONDS early)
-                    tail = int(next_tick_dt.timestamp() - time.time())
-                    for _ in range(max(0, tail)):
-                        if self._opt_stop.is_set():
-                            break
-                        time.sleep(1)
-                else:
-                    # Plain sleep — no piggyback or wait too short to be worth it.
-                    for _ in range(wait):
-                        if self._opt_stop.is_set():
-                            break
-                        time.sleep(1)
+                for _ in range(wait):
+                    if self._opt_stop.is_set():
+                        break
+                    time.sleep(1)
         finally:
             sys.stdout = old_out
             self._ui(self._opt_lbl.config, text="○ Stopped", fg=C["dim"])
@@ -717,7 +1064,12 @@ class DarkThroneApp:
             self._cfg["battle_skip_friends"] = bool(self._battle_skip_friends.get())
             self._cfg["battle_skip_clan"]    = bool(self._battle_skip_clan.get())
             self._cfg["battle_skip_bots"]    = bool(self._battle_skip_bots.get())
-            self._cfg["battle_during_wait"]  = bool(self._battle_during_wait.get())
+            self._cfg["battle_farm_mode"]    = self._battle_farm_mode.get()
+            # min_gold: accept integer, silently clamp bad input to 0
+            try:
+                self._cfg["battle_min_gold"] = max(0, int(self._battle_min_gold.get() or 0))
+            except (TypeError, ValueError):
+                self._cfg["battle_min_gold"] = 0
             self._save_config_file()
         except Exception:
             pass
@@ -731,30 +1083,13 @@ class DarkThroneApp:
     def _start_battle(self):
         if self._battle_thread and self._battle_thread.is_alive():
             return
-        if self._opt_thread and self._opt_thread.is_alive():
-            # If the optimizer's "Battle during wait" option is enabled, the
-            # standalone Start Battle button is redundant — the piggyback is
-            # already running battle during the wait phase.  Nudge the user.
-            if bool(self._battle_during_wait.get()):
-                messagebox.showinfo(
-                    "Already piggybacking",
-                    "The optimizer is already running auto-battle during its "
-                    "wait phase ('Battle during optimizer wait' is checked). "
-                    "No need to start a separate battle session.")
-                return
-            # Otherwise: allow starting, but warn about the race risk.
-            if not messagebox.askokcancel(
-                    "Optimizer running",
-                    "The optimizer is running.  Auto-battle will share the "
-                    "browser session with the next tick via a lockfile; if "
-                    "a tick fires while battle is active, the tick will be "
-                    "skipped for this cycle.\n\nTip: enable 'Battle during "
-                    "optimizer wait' instead to let the optimizer coordinate "
-                    "both automatically.\n\nProceed anyway?"):
-                return
         if not os.path.isfile(AUTH_FILE):
             messagebox.showwarning("Not logged in", "Please log in first.")
             return
+        # When the optimizer is also running, the two loops share the
+        # browser session via a lockfile — if a tick fires while battle
+        # is mid-action, the tick briefly waits its turn. No prompt
+        # needed; this is the normal "run both at once" mode.
 
         self._save_battle_cfg()
         self._battle_stop.clear()
@@ -767,8 +1102,10 @@ class DarkThroneApp:
         self._battle_stop_btn.config(state="normal")
         self._log_write(
             f"▶ Auto-Battle started — mode={self._battle_mode.get()} "
+            f"farm={self._battle_farm_mode.get()} "
             f"turns/hit={self._battle_turns.get()} "
-            f"margin={self._battle_margin.get()}\n", "battle")
+            f"margin={self._battle_margin.get()} "
+            f"min_gold={self._battle_min_gold.get() or 0}\n", "battle")
 
     def _stop_battle(self):
         self._battle_stop.set()
@@ -783,6 +1120,10 @@ class DarkThroneApp:
             margin = float(self._battle_margin.get() or 1.2)
         except Exception:
             margin = 1.2
+        try:
+            min_gold = max(0, int(self._battle_min_gold.get() or 0))
+        except (TypeError, ValueError):
+            min_gold = 0
         cfg = {
             "mode":          self._battle_mode.get(),
             "margin":        max(1.0, margin),
@@ -790,6 +1131,8 @@ class DarkThroneApp:
             "skip_friends":  bool(self._battle_skip_friends.get()),
             "skip_clan":     bool(self._battle_skip_clan.get()),
             "skip_bots":     bool(self._battle_skip_bots.get()),
+            "farm_mode":     self._battle_farm_mode.get(),
+            "min_gold":      min_gold,
             "max_per_pass":  20,
             "max_total":     200,
             "scrape_pages":  10,
@@ -891,14 +1234,112 @@ def _check_deps():
         sys.exit(1)
 
 
+def _chromium_installed() -> bool:
+    """Check whether Playwright's chromium browser has already been
+    downloaded to the cache dir. Returns False for a fresh install where
+    first-run setup is still needed."""
+    cache = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or os.path.join(
+        os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ms-playwright")
+    if not os.path.isdir(cache):
+        return False
+    # Playwright installs into `chromium-{version}/chrome-win/chrome.exe`.
+    # Finding any chrome.exe deep under the cache is a good signal.
+    for root_dir, _dirs, files in os.walk(cache):
+        if "chrome.exe" in files:
+            return True
+    return False
+
+
+def _install_chromium_with_splash():
+    """Show a modal Tk splash + progress while Playwright downloads Chromium.
+
+    Invoked only on first launch when _chromium_installed() is False.
+    Uses the bundled playwright module (no external python needed).
+    """
+    import tkinter as _tk
+    splash = _tk.Tk()
+    splash.title("DarkThrone Suite — First-time setup")
+    splash.configure(bg="#0f0f14")
+    splash.geometry("460x200")
+    splash.resizable(False, False)
+
+    _tk.Label(splash, text="\U0001f3f0  Welcome to DarkThrone Suite",
+              bg="#0f0f14", fg="#ffd700",
+              font=("Segoe UI", 13, "bold")).pack(pady=(20, 6))
+    _tk.Label(splash,
+              text="Downloading browser automation (~150 MB)\n"
+                   "This happens once — future launches are instant.",
+              bg="#0f0f14", fg="#e0e0e0",
+              font=("Segoe UI", 9), justify="center").pack(pady=4)
+    status = _tk.Label(splash, text="Starting download…",
+                       bg="#0f0f14", fg="#666680",
+                       font=("Consolas", 8))
+    status.pack(pady=(10, 6))
+    pb = ttk.Progressbar(splash, mode="indeterminate", length=340)
+    pb.pack(pady=(0, 8))
+    pb.start(10)
+    splash.update()
+
+    import subprocess
+    done = {"ok": False, "error": None}
+
+    def _run_install():
+        try:
+            # Invoke Playwright's CLI module directly via the bundled
+            # Python runtime. PyInstaller-frozen apps don't have a
+            # standalone python.exe, so we use the current process's
+            # interpreter via runpy.
+            import runpy, sys as _sys
+            _old_argv = _sys.argv
+            _sys.argv = ["playwright", "install", "chromium"]
+            try:
+                runpy.run_module("playwright", run_name="__main__")
+            except SystemExit as se:
+                # playwright's CLI calls sys.exit(0) on success
+                if se.code not in (0, None):
+                    raise
+            finally:
+                _sys.argv = _old_argv
+            done["ok"] = True
+        except Exception as e:
+            done["error"] = e
+
+    t = threading.Thread(target=_run_install, daemon=True)
+    t.start()
+
+    # Pump the Tk event loop until the worker finishes
+    while t.is_alive():
+        splash.update()
+        time.sleep(0.1)
+
+    pb.stop()
+    splash.destroy()
+
+    if not done["ok"]:
+        err = done.get("error") or "unknown error"
+        messagebox.showerror(
+            "First-time setup failed",
+            f"Could not download the browser:\n\n{err}\n\n"
+            f"You can retry by restarting the Suite. If it keeps failing,\n"
+            f"check your internet connection or firewall.")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     _check_deps()
 
+    # First-run: download Chromium (~150 MB) with a progress splash.
+    # After this completes, subsequent launches go straight to the main GUI.
+    if not _chromium_installed():
+        _install_chromium_with_splash()
+
     root = tk.Tk()
 
-    # Style ttk combobox to match dark theme
+    # Style ttk widgets to match dark theme
     style = ttk.Style(root)
     style.theme_use("clam")
+
+    # Combobox
     style.configure("TCombobox",
                     fieldbackground=C["btn"],
                     background=C["btn"],
@@ -909,6 +1350,25 @@ if __name__ == "__main__":
     style.map("TCombobox",
               fieldbackground=[("readonly", C["btn"])],
               foreground=[("readonly", C["text"])])
+
+    # Notebook (tabbed pane)
+    style.configure("Dark.TNotebook",
+                    background=C["bg"],
+                    borderwidth=0,
+                    tabmargins=[0, 0, 0, 0])
+    style.configure("Dark.TNotebook.Tab",
+                    background=C["btn"],
+                    foreground=C["dim"],
+                    padding=[8, 3],
+                    font=("Segoe UI", 9),
+                    borderwidth=0,
+                    width=8)
+    style.map("Dark.TNotebook.Tab",
+              background=[("selected", C["card"]),
+                          ("active",   C["btn_act"])],
+              foreground=[("selected", C["gold"]),
+                          ("active",   C["text"])],
+              expand=[("selected", [0, 0, 0, 0])])
 
     # Window icon (if icon file present)
     ico = os.path.join(os.path.dirname(__file__), "icon.ico")

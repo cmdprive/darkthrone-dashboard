@@ -81,7 +81,7 @@ ESTIMATES = {
     # "Stranger" intentionally missing
 }
 
-OUR_STATS = {"atk": 100_000, "spy_off": 15_000, "gold": 50_000, "turns": 500}
+OUR_STATS = {"atk": 100_000, "spy_off": 15_000, "gold": 50_000, "turns": 500, "level": 15}
 
 def _names(targets):
     return [t["name"] for t in targets]
@@ -168,6 +168,147 @@ def run():
     check("C (gold=500, fort=90) first",  order[0] == "C")
     check("B (gold=500, fort=10) second", order[1] == "B")
     check("A (gold=100) last",            order[2] == "A")
+
+    # ── min_gold filter ──────────────────────────────────────────────
+    print("\n=== min_gold filter (skip targets below threshold) ===")
+    cfg_mg = dict(cfg, min_gold=200_000)
+    t = opt.pick_battle_targets(ROWS, ESTIMATES, OUR_STATS, cfg_mg, mode="attack")
+    names = _names(t)
+    check("RichWeakling (500k gold) still in",  "RichWeakling" in names)
+    check("PoorWeakling (50k gold) filtered",   "PoorWeakling" not in names)
+    check("[bot] Filler (200k gold) still in",  "[bot] Filler" in names)
+
+    cfg_mg_hi = dict(cfg, min_gold=600_000)
+    t = opt.pick_battle_targets(ROWS, ESTIMATES, OUR_STATS, cfg_mg_hi, mode="attack")
+    check("min_gold=600k drops everyone under the bar",
+          "RichWeakling" not in _names(t) and "PoorWeakling" not in _names(t))
+
+    # Spy mode should NOT be touched by min_gold (it has its own gold cost).
+    cfg_mg_spy = dict(cfg, min_gold=999_999_999)
+    t = opt.pick_battle_targets(ROWS, ESTIMATES, OUR_STATS, cfg_mg_spy, mode="spy")
+    check("spy mode ignores min_gold", len(t) >= 1)
+
+    # ── farm_mode=xp (sort by level differential) ─────────────────────
+    print("\n=== farm_mode=xp (prefer high-level targets) ===")
+    rows_xp = [
+        # Same gold, different levels → XP mode should prefer higher level
+        {"player_id":"300","name":"LowLv","gold":100_000,"fort_pct":50,
+         "level":5, "in_range":True,"is_bot":False,"is_clan":False,
+         "is_friend":False,"is_hitlist":False,"attack_count":0},
+        {"player_id":"301","name":"MidLv","gold":100_000,"fort_pct":50,
+         "level":15,"in_range":True,"is_bot":False,"is_clan":False,
+         "is_friend":False,"is_hitlist":False,"attack_count":0},
+        {"player_id":"302","name":"HighLv","gold":100_000,"fort_pct":50,
+         "level":25,"in_range":True,"is_bot":False,"is_clan":False,
+         "is_friend":False,"is_hitlist":False,"attack_count":0},
+    ]
+    ests_xp = {
+        "LowLv":  {"est_def": 5_000, "est_spy_def": 100},
+        "MidLv":  {"est_def": 5_000, "est_spy_def": 100},
+        "HighLv": {"est_def": 5_000, "est_spy_def": 100},
+    }
+    cfg_xp = dict(cfg, farm_mode="xp")
+    t = opt.pick_battle_targets(rows_xp, ests_xp, OUR_STATS, cfg_xp, mode="attack")
+    order_xp = _names(t)
+    check("XP mode ranks HighLv first",  order_xp and order_xp[0] == "HighLv")
+    check("XP mode ranks MidLv second",  len(order_xp) > 1 and order_xp[1] == "MidLv")
+    check("XP mode ranks LowLv last",    len(order_xp) > 2 and order_xp[2] == "LowLv")
+
+    # Gold mode on the same rows → all equal, ties broken by fort_pct (also equal)
+    # so order is stable input order. The point is XP order != gold order when
+    # gold is equal but levels differ.
+    cfg_gold = dict(cfg, farm_mode="gold")
+    t = opt.pick_battle_targets(rows_xp, ests_xp, OUR_STATS, cfg_gold, mode="attack")
+    check("Gold mode returns all 3 (no ranking change)", len(_names(t)) == 3)
+
+    # XP mode with mixed gold: high-level target wins even if poorer
+    rows_xp_mixed = [
+        {"player_id":"400","name":"RichLowLv","gold":500_000,"fort_pct":50,
+         "level":10,"in_range":True,"is_bot":False,"is_clan":False,
+         "is_friend":False,"is_hitlist":False,"attack_count":0},
+        {"player_id":"401","name":"PoorHighLv","gold":1_000,"fort_pct":50,
+         "level":25,"in_range":True,"is_bot":False,"is_clan":False,
+         "is_friend":False,"is_hitlist":False,"attack_count":0},
+    ]
+    ests_xp_mixed = {
+        "RichLowLv":  {"est_def": 5_000, "est_spy_def": 100},
+        "PoorHighLv": {"est_def": 5_000, "est_spy_def": 100},
+    }
+    t = opt.pick_battle_targets(rows_xp_mixed, ests_xp_mixed, OUR_STATS, cfg_xp, mode="attack")
+    check("XP mode picks PoorHighLv over RichLowLv",
+          _names(t) and _names(t)[0] == "PoorHighLv")
+    # Gold mode flips the order
+    t = opt.pick_battle_targets(rows_xp_mixed, ests_xp_mixed, OUR_STATS, cfg_gold, mode="attack")
+    check("Gold mode picks RichLowLv over PoorHighLv",
+          _names(t) and _names(t)[0] == "RichLowLv")
+
+    # ── farm_mode=match (strongest-beatable target first) ────────────
+    print("\n=== farm_mode=match (strongest beatable target first) ===")
+    rows_match = [
+        # WeakRich: poor def, lots of gold — what the bot used to pick first
+        {"player_id":"500","name":"WeakRich","gold":200_000,"fort_pct":50,
+         "level":10,"in_range":True,"is_bot":False,"is_clan":False,
+         "is_friend":False,"is_hitlist":False,"attack_count":0},
+        # StrongMid: hardest-beatable def, decent gold
+        {"player_id":"501","name":"StrongMid","gold":50_000,"fort_pct":50,
+         "level":15,"in_range":True,"is_bot":False,"is_clan":False,
+         "is_friend":False,"is_hitlist":False,"attack_count":0},
+        # WayTooStrong: above our atk — filtered out by margin
+        {"player_id":"502","name":"WayTooStrong","gold":999_999,"fort_pct":50,
+         "level":20,"in_range":True,"is_bot":False,"is_clan":False,
+         "is_friend":False,"is_hitlist":False,"attack_count":0},
+    ]
+    ests_match = {
+        "WeakRich":     {"est_def":   200, "est_spy_def": 100},
+        "StrongMid":    {"est_def": 50_000, "est_spy_def": 100},   # = our_atk/2 = safe
+        "WayTooStrong": {"est_def": 200_000, "est_spy_def": 100},  # > our_atk → excluded
+    }
+    cfg_match = dict(cfg, farm_mode="match")
+    t = opt.pick_battle_targets(rows_match, ests_match, OUR_STATS, cfg_match, mode="attack")
+    order_match = _names(t)
+    check("match mode excludes WayTooStrong",     "WayTooStrong" not in order_match)
+    check("match mode picks StrongMid over WeakRich",
+          order_match and order_match[0] == "StrongMid",
+          f"got {order_match}")
+    check("match mode still includes WeakRich last",
+          "WeakRich" in order_match)
+
+    # Same rows in gold mode → WeakRich wins on raw gold
+    cfg_gold_match = dict(cfg, farm_mode="gold")
+    t = opt.pick_battle_targets(rows_match, ests_match, OUR_STATS, cfg_gold_match, mode="attack")
+    check("gold mode still picks WeakRich first (gold-priority)",
+          _names(t) and _names(t)[0] == "WeakRich")
+
+    # ── telemetry: returned list carries reasons dict ────────────────
+    print("\n=== result telemetry: reasons breakdown ===")
+    t = opt.pick_battle_targets(ROWS, ESTIMATES, OUR_STATS, cfg_mg_hi, mode="attack")
+    reasons = getattr(t, "reasons", None)
+    pool    = getattr(t, "pool_size", None)
+    check("reasons dict attached to result", isinstance(reasons, dict))
+    check("pool_size attached to result", isinstance(pool, int) and pool > 0)
+    check("under_min_gold counted when min_gold=600k",
+          bool(reasons) and reasons.get("under_min_gold", 0) > 0,
+          f"reasons={reasons}")
+    check("result still iterates like a list (len)", hasattr(t, "__len__"))
+
+    # ── gold-mode def-desc tiebreaker ────────────────────────────────
+    print("\n=== gold mode: def-desc tiebreaker for equal-gold targets ===")
+    rows_tie = [
+        {"player_id":"600","name":"EqualGoldWeak","gold":100_000,"fort_pct":50,
+         "level":10,"in_range":True,"is_bot":False,"is_clan":False,
+         "is_friend":False,"is_hitlist":False,"attack_count":0},
+        {"player_id":"601","name":"EqualGoldStrong","gold":100_000,"fort_pct":50,
+         "level":10,"in_range":True,"is_bot":False,"is_clan":False,
+         "is_friend":False,"is_hitlist":False,"attack_count":0},
+    ]
+    ests_tie = {
+        "EqualGoldWeak":   {"est_def":  1_000, "est_spy_def": 100},
+        "EqualGoldStrong": {"est_def": 40_000, "est_spy_def": 100},
+    }
+    t = opt.pick_battle_targets(rows_tie, ests_tie, OUR_STATS, cfg_gold_match, mode="attack")
+    check("gold mode tiebreaks to higher def",
+          _names(t) and _names(t)[0] == "EqualGoldStrong",
+          f"got {_names(t)}")
 
     print(f"\n{'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1

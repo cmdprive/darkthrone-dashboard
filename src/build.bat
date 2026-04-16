@@ -15,7 +15,7 @@ for /f "delims=" %%i in ('python -c "import sys,os;print(os.path.join(os.path.di
 set PATH=%PYBIN%;%PATH%
 
 :: ── Step 1: Install build tools ───────────────────────────────────────────
-echo  [1/4] Installing build tools...
+echo  [1/5] Installing build tools...
 python -m pip install pyinstaller --quiet
 if errorlevel 1 (
     echo  [ERROR] Could not install build tools.
@@ -24,7 +24,7 @@ if errorlevel 1 (
 
 :: ── Step 2: Compile source files to bytecode (.pyc) ───────────────────────
 echo.
-echo  [2/4] Compiling source to bytecode...
+echo  [2/5] Compiling source to bytecode...
 python -m compileall -b -q ^
     installer\darkthrone_app.py ^
     optimizer.py
@@ -35,7 +35,7 @@ if errorlevel 1 (
 
 :: ── Step 3: Bundle into .exe with PyInstaller ─────────────────────────────
 echo.
-echo  [3/4] Compiling to .exe (this takes a few minutes)...
+echo  [3/5] Compiling to .exe (this takes a few minutes)...
 if exist dist  rmdir /s /q dist
 if exist build rmdir /s /q build
 
@@ -45,8 +45,13 @@ pyinstaller ^
     --name "DarkThrone Suite" ^
     --add-data "optimizer.pyc;." ^
     --add-data "index.html;." ^
+    --add-data "_version.py;." ^
+    --add-data "installer\updater.py;." ^
+    --hidden-import "_version" ^
+    --hidden-import "updater" ^
     --hidden-import "playwright" ^
     --hidden-import "playwright.sync_api" ^
+    --hidden-import "playwright.__main__" ^
     --hidden-import "tkinter" ^
     --hidden-import "tkinter.ttk" ^
     --hidden-import "tkinter.scrolledtext" ^
@@ -62,7 +67,7 @@ if errorlevel 1 (
 
 :: ── Step 4: Assemble release folder (parent of src\) ──────────────────────
 echo.
-echo  [4/4] Assembling release folder...
+echo  [4/5] Assembling release folder...
 set RELEASE=..\release
 if exist "%RELEASE%\DarkThrone Suite" rmdir /s /q "%RELEASE%\DarkThrone Suite"
 if not exist "%RELEASE%" mkdir "%RELEASE%"
@@ -98,6 +103,31 @@ echo @echo off
 echo start "" "%%~dp0DarkThrone Suite\DarkThrone Suite.exe"
 ) > "%RELEASE%\DarkThrone Suite.bat"
 
+:: ── Step 5: Build installer via Inno Setup ───────────────────────────────
+:: Produces release\installers\DarkThroneSuite-Setup-vX.Y.Z.exe — single-file
+:: installer users can double-click. No .bat files, no manual playwright
+:: step. Requires Inno Setup 6 installed on the dev machine once.
+echo.
+echo  [5/5] Building installer via Inno Setup...
+:: Inno Setup 6 install path — try x86 then x64. We use call syntax to
+:: avoid batch's issues with parentheses inside quoted paths.
+set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+if not exist "%ISCC%" set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
+if not exist "%ISCC%" (
+    echo  [WARN] Inno Setup 6 not found — skipping installer build.
+    echo         Install from https://jrsoftware.org/isinfo.php
+    echo         then rerun this script to produce the Setup.exe.
+    goto :cleanup
+)
+if not exist "..\release\installers" mkdir "..\release\installers"
+"%ISCC%" installer\darkthrone_suite.iss
+if errorlevel 1 (
+    echo  [ERROR] Inno Setup build failed — check output above.
+    goto :cleanup
+)
+echo  [OK]   Installer at release\installers\DarkThroneSuite-Setup-*.exe
+
+:cleanup
 :: Clean up temp files
 rmdir /s /q dist
 rmdir /s /q build
@@ -107,12 +137,15 @@ del /q installer\*.pyc 2>nul
 
 echo.
 echo  ================================================
-echo   Done!  %RELEASE%\ folder is ready to distribute.
+echo   Done!  release/ is ready to distribute.
 echo.
-echo   Contents of %RELEASE%\:
-echo     install_browser.bat   ^← run once on first use
-echo     DarkThrone Suite.bat  ^← launch shortcut
-echo     DarkThrone Suite\     ^← the application
+echo   For public release:
+echo     release\installers\DarkThroneSuite-Setup-*.exe  ^← give this to users
+echo.
+echo   For portable / dev use:
+echo     release\DarkThrone Suite\          ^← raw bundled app
+echo     release\DarkThrone Suite.bat       ^← quick launch shortcut
+echo     release\install_browser.bat        ^← legacy chromium-install helper
 echo.
 echo  ================================================
 echo.

@@ -55,67 +55,24 @@ GEAR = {
 ARMORY_MAX_TIER = {0:3, 1:5, 2:7, 3:8, 4:9, 5:10}
 ARMORY_TAB = {"guard":"defense","soldier":"offense","sentry":"spy-defense","spy":"spy-offense"}
 
-# ── Strategy profiles ─────────────────────────────────────────────────────────
-# weights  : relative share of idle citizens assigned to each unit type
-#            (0 = never train this type)
-# gear_pri : unit types sorted by gear-fill priority (first = buy gear first)
-# bld_skip : building types to skip for this strategy
-STRATEGIES = {
-    "balanced": {
-        "label":    "⚖️  Balanced",
-        "desc":     "Even spread — workers, soldiers, guards, spies, sentries",
-        "weights":  {"worker":1, "soldier":1, "guard":1, "spy":1, "sentry":1},
-        "gear_pri": ["guard","soldier","spy","sentry"],
-        "bld_skip": [],
-    },
-    "attack": {
-        "label":    "⚔️  Attack",
-        "desc":     "Heavy soldiers — max offense, light defense",
-        "weights":  {"worker":2, "soldier":5, "guard":1, "spy":1, "sentry":0},
-        "gear_pri": ["soldier","guard","spy","sentry"],
-        "bld_skip": [],
-    },
-    "defense": {
-        "label":    "🛡️  Defense",
-        "desc":     "Heavy guards — max defense, light offense",
-        "weights":  {"worker":2, "soldier":1, "guard":5, "spy":0, "sentry":1},
-        "gear_pri": ["guard","soldier","sentry","spy"],
-        "bld_skip": [],
-    },
-    "economy": {
-        "label":    "💰  Economy",
-        "desc":     "Max workers and income buildings, minimal army",
-        "weights":  {"worker":7, "soldier":1, "guard":1, "spy":0, "sentry":0},
-        "gear_pri": ["guard","soldier"],
-        "bld_skip": ["spy","mercs"],
-    },
-    "spy": {
-        "label":    "🗡️  Spy",
-        "desc":     "Heavy spies and sentries, intelligence focused",
-        "weights":  {"worker":2, "soldier":0, "guard":0, "spy":4, "sentry":4},
-        "gear_pri": ["spy","sentry","soldier","guard"],
-        "bld_skip": [],
-    },
-    "hybrid": {
-        "label":    "⚔️🛡️  Hybrid",
-        "desc":     "Soldiers + guards only, skip spy units",
-        "weights":  {"worker":2, "soldier":3, "guard":3, "spy":0, "sentry":0},
-        "gear_pri": ["soldier","guard","spy","sentry"],
-        "bld_skip": ["spy"],
-    },
-}
-DEFAULT_STRATEGY = "balanced"
+# Legacy STRATEGIES dict and DEFAULT_STRATEGY constant were removed
+# 2026-04-16 after the decide_v2 engine proved stable. The 3 new profiles
+# (grow / combat / defend) live in STRATEGY_WEIGHTS near decide_v2 below.
+# Legacy config values (balanced, attack, spy, ...) are auto-migrated to
+# the new keys via _normalize_strategy_key().
 
 def load_strategy():
-    """Read chosen strategy from user_config.json, fall back to balanced."""
+    """Read chosen strategy from user_config.json. Defaults to 'grow'.
+    Legacy values (balanced, attack, spy, ...) are re-mapped to the
+    3-profile decide_v2 set by _normalize_strategy_key() at call time."""
     cfg_file = "user_config.json"
     if os.path.isfile(cfg_file):
         try:
             with open(cfg_file, encoding="utf-8") as f:
-                return json.load(f).get("strategy", DEFAULT_STRATEGY)
-        except Exception:
-            pass
-    return DEFAULT_STRATEGY
+                return json.load(f).get("strategy", "grow")
+        except Exception as _e:
+            print(f"  ⚠️  load_strategy: {cfg_file} unreadable ({_e}) — using default 'grow'")
+    return "grow"
 
 # Buildings in income priority, then citizen-growth, then power
 BUILDINGS = [
@@ -602,233 +559,11 @@ def _gear_cost_for_unit(s, unit):
     return wc, ac, mt_w, mt_a
 
 
-def decide(s, cats, strategy=None):
-    """
-    Returns ordered list of actions to take this tick.
-    Core principle: NEVER hold gold back. Gear existing army first, then train.
-
-    strategy : key from STRATEGIES dict (default: load from user_config.json)
-
-    Priority order:
-      1. Repair fort
-      2. Fill gear gaps on ALL existing units (weapon + armor)
-      3. Upgrade ALL existing units to max available gear tier
-      4. Train new citizens (weighted by strategy) + immediately gear them
-      5. Mine / income building upgrade
-      6. Other buildings
-      7. Battle upgrades
-    """
-    gold      = s["gold"]
-    income    = s["income"]
-    level     = s["level"]
-    builds    = s["buildings"]
-    citizens  = s["citizens"]
-    actions   = []
-    gold_left = gold
-
-    # ── Load strategy ─────────────────────────────────────────────────────────
-    strat_key = strategy or load_strategy()
-    strat     = STRATEGIES.get(strat_key, STRATEGIES[DEFAULT_STRATEGY])
-    print(f"  📋 Strategy: {strat['label']}  ({strat['desc']})")
-
-    COMBAT_TYPES = {"soldier", "guard", "spy", "sentry"}
-
-    # ── 1. Fort repair ────────────────────────────────────────────────────────
-    fort_dmg = s.get("fort_max_hp", 100) - s.get("fort_hp", 100)
-    if fort_dmg > 0:
-        repair_cost = int(fort_dmg * s.get("cost_per_hp", 16.75)) + 1
-        if gold_left >= repair_cost:
-            actions.append({"type":"REPAIR_FORT","damage":fort_dmg,"cost":repair_cost,
-                             "reason":f"fort at {s.get('fort_pct',100)}% HP"})
-            gold_left -= repair_cost
-        else:
-            actions.append({"type":"SAVE_FOR_REPAIR","cost":repair_cost,
-                             "reason":f"fort damaged {fort_dmg} HP, need {repair_cost:,}g"})
-
-    # ── Gear sort helper ──────────────────────────────────────────────────────
-    gear_pri = strat["gear_pri"]
-    def _gear_sort(c):
-        try:    pri = gear_pri.index(c["unit"])
-        except: pri = 99
-        return (pri, c["score"])
-
-    # ── 2. Fill gear gaps on existing units ───────────────────────────────────
-    for cat in sorted(cats, key=_gear_sort):
-        unit  = cat["unit"]
-        units = cat["units"]
-        if units == 0: continue
-        for slot, gap, tier in [
-            ("weapon", cat["w_gap"], cat["w_tier"]),
-            ("armor",  cat["a_gap"], cat["a_tier"]),
-        ]:
-            if gap <= 0 or tier not in GEAR.get((unit, slot), {}):
-                continue
-            name, _, cost = GEAR[(unit, slot)][tier]
-            total = cost * gap
-            if gold_left >= total:
-                actions.append({"type":"BUY_GEAR","unit":unit,"slot":slot,
-                                 "qty":gap,"name":name,"tier":tier,"cost":cost,
-                                 "total":total,"tab":ARMORY_TAB[unit],
-                                 "reason":f"{gap} existing {unit}s missing {slot}"})
-                gold_left -= total
-            elif gold_left >= cost:
-                can = gold_left // cost
-                actions.append({"type":"BUY_GEAR","unit":unit,"slot":slot,
-                                 "qty":can,"name":name,"tier":tier,"cost":cost,
-                                 "total":cost*can,"tab":ARMORY_TAB[unit],
-                                 "reason":f"partial fill: {can}/{gap} {unit}s"})
-                gold_left -= cost * can
-
-    # ── 3. Upgrade existing units to max available gear tier ──────────────────
-    for cat in sorted(cats, key=_gear_sort):
-        unit  = cat["unit"]
-        units = cat["units"]
-        if units == 0: continue
-        for slot in ("weapon", "armor"):
-            cur_t    = cat["w_tier"] if slot == "weapon" else cat["a_tier"]
-            slot_max = cat["w_max_t"] if slot == "weapon" else cat["a_max_t"]
-            while cur_t < slot_max:
-                next_t = cur_t + 1
-                while next_t <= slot_max and next_t not in GEAR.get((unit, slot), {}):
-                    next_t += 1
-                if next_t > slot_max:
-                    break
-                old_cost  = GEAR[(unit, slot)].get(cur_t, (None, None, 0))[2]
-                new_cost  = GEAR[(unit, slot)].get(next_t, (None, None, 0))[2]
-                upg_per   = new_cost - old_cost
-                if upg_per <= 0:
-                    cur_t = next_t
-                    continue
-                new_name = GEAR[(unit, slot)][next_t][0]
-                can   = min(units, gold_left // upg_per)
-                if can > 0:
-                    total = upg_per * can
-                    actions.append({"type":"UPGRADE_GEAR","unit":unit,"slot":slot,
-                                    "qty":can,"name":new_name,"tier":next_t,
-                                    "cost":upg_per,"total":total,"tab":ARMORY_TAB[unit],
-                                    "reason":f"T{cur_t}→T{next_t} for {can}/{units} {unit}s"})
-                    gold_left -= total
-                if can < units:
-                    break
-                cur_t = next_t
-
-    # ── 4. Train new citizens (weighted by strategy) + immediately gear them ──
-    if citizens > 0:
-        weights   = strat["weights"]
-        active    = [(u, w) for u, w in weights.items() if w > 0]
-        total_w   = sum(w for _, w in active)
-
-        allocs = {}
-        leftover = citizens
-        for unit, w in active:
-            allocs[unit] = int(citizens * w / total_w)
-            leftover -= allocs[unit]
-        for unit, _ in sorted(active, key=lambda x: -x[1]):
-            if leftover <= 0:
-                break
-            allocs[unit] += 1
-            leftover -= 1
-
-        remaining_citizens = citizens
-        for unit, alloc in allocs.items():
-            if remaining_citizens <= 0 or gold_left <= 0:
-                break
-            alloc = min(alloc, remaining_citizens)
-            if alloc <= 0:
-                continue
-
-            if unit in COMBAT_TYPES:
-                wc, ac, mt_w, mt_a = _gear_cost_for_unit(s, unit)
-                cost_per = UNIT_COST[unit] + wc + ac
-            else:
-                cost_per = UNIT_COST[unit]
-                mt_w = mt_a = 0
-
-            if cost_per <= 0:
-                continue
-
-            count = min(alloc, gold_left // cost_per)
-            if count <= 0:
-                # Can't afford train+gear together — train bare, gear next tick
-                count = min(alloc, gold_left // UNIT_COST[unit])
-
-            if count <= 0:
-                continue
-
-            remaining_citizens -= count
-            train_gold = UNIT_COST[unit] * count
-            actions.append({"type":"TRAIN","unit":unit,"count":count,"cost":train_gold,
-                             "reason":f"{strat_key} ({count}/{alloc} slot)",
-                             **({"w_max_t":mt_w,"a_max_t":mt_a} if unit in COMBAT_TYPES else {})})
-            gold_left -= train_gold
-
-            # Immediately buy max-tier gear for newly trained combat units
-            if unit in COMBAT_TYPES:
-                for slot, mt, slot_cost in [("weapon", mt_w, wc), ("armor", mt_a, ac)]:
-                    if mt >= 1 and slot_cost > 0:
-                        total = slot_cost * count
-                        if gold_left >= total:
-                            gear_name = GEAR[(unit, slot)].get(mt, (f"T{mt}", 0, 0))[0]
-                            actions.append({"type":"BUY_GEAR","unit":unit,"slot":slot,
-                                            "qty":count,"name":gear_name,"tier":mt,
-                                            "cost":slot_cost,"total":total,
-                                            "tab":ARMORY_TAB[unit],
-                                            "reason":f"gear for {count} newly trained {unit}s"})
-                            gold_left -= total
-                        elif gold_left >= slot_cost:
-                            can = gold_left // slot_cost
-                            gear_name = GEAR[(unit, slot)].get(mt, (f"T{mt}", 0, 0))[0]
-                            actions.append({"type":"BUY_GEAR","unit":unit,"slot":slot,
-                                            "qty":can,"name":gear_name,"tier":mt,
-                                            "cost":slot_cost,"total":slot_cost*can,
-                                            "tab":ARMORY_TAB[unit],
-                                            "reason":f"partial gear: {can}/{count} {unit}s"})
-                            gold_left -= slot_cost * can
-
-    # ── 5. Mine / income building upgrade (after gear is handled) ────────────
-    for bname, req_lv, base_cost, max_lv, btype in BUILDINGS:
-        if btype != "income": continue
-        cur_lv = builds.get(bname, 0)
-        if cur_lv >= max_lv or level < req_lv: continue
-        prereq = BUILDING_PREREQ.get((bname, cur_lv + 1), {})
-        if any(builds.get(b, 0) < req for b, req in prereq.items()):
-            continue
-        cost = base_cost * (cur_lv + 1)
-        if gold_left >= cost:
-            actions.append({"type":"BUILD","name":bname,"cost":cost,"lv":cur_lv+1,
-                             "reason":f"+{income*0.10:.0f}/tick"})
-            gold_left -= cost
-        break
-
-    # ── 6. Other buildings ────────────────────────────────────────────────────
-    bld_skip = strat.get("bld_skip", [])
-    for bname, req_lv, base_cost, max_lv, btype in BUILDINGS:
-        if btype == "income": continue
-        if btype in bld_skip: continue
-        cur_lv = builds.get(bname, 0)
-        if cur_lv >= max_lv or level < req_lv: continue
-        prereq = BUILDING_PREREQ.get((bname, cur_lv + 1), {})
-        if any(builds.get(b, 0) < req for b, req in prereq.items()):
-            continue
-        cost = base_cost * (cur_lv + 1)
-        if gold_left >= cost:
-            actions.append({"type":"BUILD","name":bname,"cost":cost,"lv":cur_lv+1,
-                             "reason":f"Lv{cur_lv+1}"})
-            gold_left -= cost
-        break
-
-    # ── 7. Battle upgrades when all gear fully maxed ──────────────────────────
-    all_maxed = all(c["fully_maxed"] or c["units"] == 0 for c in cats)
-    if all_maxed:
-        for upg_name, upg_info in s.get("upgrades_buyable", {}).items():
-            cost = upg_info.get("cost", 0) if isinstance(upg_info, dict) else upg_info
-            if cost and gold_left >= cost:
-                actions.append({"type":"BUY_UPGRADE","name":upg_name,"qty":1,
-                                 "cost":cost,"total":cost,
-                                 "reason":"all gear maxed — buying battle upgrade"})
-                gold_left -= cost
-
-    return actions, gold_left
+# ──────────────────────────────────────────────────────────────────────
+# Legacy decide() function (7-stage priority pipeline) removed
+# 2026-04-16 after decide_v2 (below) proved stable. See git history
+# if you need to reference the old logic.
+# ──────────────────────────────────────────────────────────────────────
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -845,11 +580,6 @@ def decide(s, cats, strategy=None):
 # the action dicts the existing execute() / _build() / _buy_gear() / _train() /
 # _buy_upgrade() / _repair_fort() / _bank() functions already consume.  No
 # changes to execute() are required — decide_v2 output is drop-in compatible.
-#
-# Flip USE_DECIDE_V2 to False to revert to the legacy decide() engine (kept
-# in-file as a safety net for one release cycle).
-
-USE_DECIDE_V2 = True
 
 # How many ticks into the future we assume a spend will pay back over.
 # BOTH income and stat gains persist — income compounds per tick, and a
@@ -1330,10 +1060,13 @@ def decide_v2(s, cats, strategy=None):
     for opt in options:
         if len(actions) >= MAX_ACTIONS_PER_TICK + 1:   # +1 for fort repair
             break
-        if opt["score"] <= 0:
-            break   # nothing useful left
+        # No score <= 0 break — keep scanning ALL options. A gear upgrade
+        # that scores 0.001 is still better than hoarding gold. The loop
+        # terminates naturally when all options are exhausted or unaffordable.
         if opt["cost"] > gold_left:
             continue   # unaffordable, try next
+        if opt["cost"] <= 0:
+            continue   # skip zero-cost options (defensive)
         if opt["type"] == "BUY_UPGRADE":
             if battle_upgrades_used >= MAX_BATTLE_UPGRADES:
                 continue
@@ -1341,15 +1074,8 @@ def decide_v2(s, cats, strategy=None):
         actions.append(opt)
         gold_left -= opt["cost"]
 
-    # ── 4. Bank residue ─────────────────────────────────────────────────────
-    # Only deposit if there's enough left to be worth a navigation round-trip.
-    if gold_left >= 50_000:
-        actions.append({
-            "type":   "BANK",
-            "amount": gold_left,
-            "cost":   0,
-            "reason": f"deposit {gold_left:,}g residue",
-        })
+    # No banking — all gold should be spent on strategy items. If nothing
+    # is available to buy, gold stays in hand for the next tick or auto-battle.
 
     return actions, gold_left
 
@@ -1361,10 +1087,13 @@ def decide_v2(s, cats, strategy=None):
 
 # ── EXECUTE ACTIONS ────────────────────────────────────────────────────────────
 def execute(page, actions, gold):
+    succeeded = 0
+    failed    = 0
     for a in actions:
         t = a["type"]
         if t in ("SAVE_FOR_BUILD","SAVE_FOR_GEAR","SAVE_FOR_UPGRADE","SAVE_FOR_REPAIR"): continue
 
+        gold_before = gold
         if t == "BUILD":
             gold = _build(page, a, gold)
         elif t in ("BUY_GEAR","UPGRADE_GEAR"):
@@ -1377,6 +1106,21 @@ def execute(page, actions, gold):
             gold = _buy_upgrade(page, a, gold)
         elif t == "BANK":
             gold = _bank(page, a, gold)
+        else:
+            continue
+
+        # Track: if gold didn't change, the executor silently failed
+        if gold < gold_before:
+            succeeded += 1
+        else:
+            failed += 1
+            print(f"      ❌ {t} '{a.get('reason','')}' — gold unchanged (likely failed on page)")
+
+    if succeeded or failed:
+        total = succeeded + failed
+        tag = "✅" if failed == 0 else "⚠️"
+        print(f"  {tag} Execute result: {succeeded}/{total} succeeded"
+              + (f", {failed} failed" if failed else ""))
     return gold
 
 # Building type IDs (confirmed from dump_buildings.html)
@@ -1648,8 +1392,11 @@ def record_growth(s, tick_num, actions):
     if os.path.isfile(GROWTH_FILE):
         _unhide(GROWTH_FILE)
         with open(GROWTH_FILE, "r", encoding="utf-8") as f:
-            try: data = json.load(f)
-            except: data = []
+            try:
+                data = json.load(f)
+            except Exception as _e:
+                print(f"  ⚠️  record_growth: {GROWTH_FILE} corrupt — starting fresh ({_e})")
+                data = []
     data.append(rec)
     if len(data) > 1000: data = data[-1000:]
     _unhide(GROWTH_FILE)
@@ -1962,13 +1709,8 @@ def run_tick():
                   f"max_tier=T{c['max_t']} {status}")
         print()
 
-        # Decide — marginal-value engine (decide_v2) unless flagged off.
-        # The legacy decide() is kept in-file as a rollback safety net;
-        # flip USE_DECIDE_V2 to False at the top of optimizer.py to revert.
-        if USE_DECIDE_V2:
-            actions, gold_after = decide_v2(s, cats)
-        else:
-            actions, gold_after = decide(s, cats)
+        # Decide — marginal-value engine.
+        actions, gold_after = decide_v2(s, cats)
         print("  🧠 DECISIONS:")
         for a in actions:
             icon = {"BUILD":"🏗️","BUY_GEAR":"⚔️","UPGRADE_GEAR":"⬆️","TRAIN":"🪖",
@@ -1984,13 +1726,12 @@ def run_tick():
         # Growth log + chart
         record_growth(s, st["ticks"], actions)
 
-        # Summary
-        executed = [a for a in actions if not a["type"].startswith("SAVE_")]
-        waiting  = [a for a in actions if a["type"].startswith("SAVE_")]
-        if executed: print(f"  ✅ Executed: {len(executed)} action(s)")
-        if waiting:
-            w = waiting[0]
-            print(f"  💾 Saving: {w.get('reason','')}")
+        # Summary — gold_before vs gold_after shows real spending
+        gold_spent = s["gold"] - gold
+        if gold_spent > 0:
+            print(f"  💰 Gold spent this tick: {gold_spent:,}  (had {s['gold']:,} → {gold:,} left)")
+        elif actions:
+            print(f"  ⚠️  {len(actions)} action(s) planned but 0 gold spent — executors may have failed")
 
         if s["xp_need"] > 0:
             left = s["xp_need"]-s["xp"]; ticks = left/60
@@ -2051,6 +1792,16 @@ def run_tick():
         except Exception as _e:
             print(f"  ⚠️ Scraper error: {_e}")
 
+        # -- Harvest spy-log history (manual + automated spies) -----------------
+        # Visits /game/spy/logs and pulls any reports we haven't seen yet.
+        # Covers manual spies the user ran through the browser — they land in
+        # the same intel pipeline as bot-initiated spies. Runs BEFORE the
+        # estimator so the fresh reports feed into calibrate_models() this tick.
+        try:
+            scrape_spy_logs(page, _ts)
+        except Exception as _e:
+            print(f"  ⚠️ Spy-log harvest error: {_e}")
+
         # -- Run estimator (writes fresh private_player_estimates.csv) ----------
         try:
             print("  🔍 Running player estimates...")
@@ -2101,23 +1852,49 @@ ATTACK_PARAMS = "sort=level&dir=desc&range=all&bots=all"
 
 
 def publish_dashboard():
-    """Commits the updated dashboard and pushes it to GitHub, forcing an update every time."""
+    """Publish the live attack-list dashboard (data/index.html) to GitHub
+    Pages as a subfolder of the existing darkthrone-estimates repo, so
+    it coexists with the estimates dashboard without needing a second
+    Pages repo.
+
+    Source:  <data>/index.html         (written by update_dashboard)
+    Target:  <repo>/attack-list/index.html
+    URL:     https://cmdprive.github.io/darkthrone-estimates/attack-list/
+    """
     print("🚀 Publishing raw data to GitHub...")
+    repo = ESTIMATES_REPO_DIR
+    if not os.path.isdir(repo):
+        print(f"  ⚠️  Estimates repo not found at {repo}")
+        print(f"      Run: git clone https://github.com/cmdprive/darkthrone-estimates \"{repo}\"")
+        return
+
+    src  = DASHBOARD_FILE
+    if not os.path.isfile(src):
+        print(f"  ⚠️  {src} not found — run update_dashboard() first")
+        return
+
+    dest_dir  = os.path.join(repo, "attack-list")
+    dest_file = os.path.join(dest_dir, "index.html")
     try:
-        # Stage the file
-        subprocess.run(["git", "add", DASHBOARD_FILE], check=True)
-        
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        
-        # Use --allow-empty to ensure a commit is created even with no file changes
-        subprocess.run([
-            "git", "commit", "--allow-empty", "-m", f"Raw data upload {timestamp}"
-        ], check=True)
-        
-        # Push to GitHub
-        subprocess.run(["git", "push"], check=True)
-        print(f"✅ Data published! View at: https://cmdprive.github.io/darkthrone-dashboard")
-        
+        os.makedirs(dest_dir, exist_ok=True)
+    except Exception as e:
+        print(f"  ⚠️  Could not create {dest_dir}: {e}")
+        return
+
+    import shutil
+    try:
+        shutil.copy2(src, dest_file)
+    except Exception as e:
+        print(f"  ⚠️  Copy failed ({src} → {dest_file}): {e}")
+        return
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        subprocess.run(["git", "-C", repo, "add", "attack-list/index.html"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "--allow-empty",
+                        "-m", f"Attack-list update {timestamp}"], check=True)
+        subprocess.run(["git", "-C", repo, "push"], check=True)
+        print(f"✅ Attack-list published → {ESTIMATES_SITE_URL}attack-list/")
     except subprocess.CalledProcessError as e:
         print(f"⚠️ Git publish failed: {e}")
 
@@ -2650,6 +2427,45 @@ def load_estimates_lookup() -> dict:
     except Exception as e:
         print(f"  ⚠️  intel overlay failed: {e}")
 
+    # ── Growth projection: use observed growth rates to predict current
+    # stats instead of relying on a stale point-in-time snapshot. The
+    # projection can only RAISE an estimate (conservative — we don't
+    # want to attack someone the model thinks is weaker than they are).
+    try:
+        _growth_hist  = load_player_growth()
+        _growth_rates = compute_growth_rates(_growth_hist)
+        _now = datetime.datetime.now()
+        _projected = 0
+        for pname, rates in _growth_rates.items():
+            if pname not in lookup:
+                continue
+            ticks_since = ((_now - rates["last_ts"]).total_seconds()) / 1800.0
+            if ticks_since <= 0:
+                continue
+            cur = lookup[pname]
+            changed = False
+            for stat_key, rate_key, last_key in [
+                ("est_def",     "def_per_tick",     "last_def"),
+                ("est_atk",     "atk_per_tick",     "last_atk"),
+                ("est_spy_off", "spy_off_per_tick", "last_spy_off"),
+                ("est_spy_def", "spy_def_per_tick", "last_spy_def"),
+            ]:
+                rate = rates.get(rate_key, 0)
+                last = rates.get(last_key, 0)
+                if rate > 0 and last > 0:
+                    projected = int(last + rate * ticks_since)
+                    if projected > cur.get(stat_key, 0):
+                        cur[stat_key] = projected
+                        changed = True
+            if changed:
+                cur["growth_def_per_tick"] = rates.get("def_per_tick", 0)
+                _projected += 1
+            lookup[pname] = cur
+        if _projected:
+            print(f"  📈 Growth projection applied to {_projected} player(s)")
+    except Exception as e:
+        print(f"  ⚠️  growth projection failed: {e}")
+
     return lookup
 
 
@@ -2880,8 +2696,27 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
     """Filter + sort battle candidates.
     rows: list from scrape_attack_candidates() / scrape_spy_candidates()
     estimates: {Player name: {est_def, est_spy_def, ...}} from load_estimates_lookup()
-    our_stats: {'atk', 'spy_off', 'gold', 'turns', ...}
-    cfg: {margin, skip_friends, skip_clan, skip_bots, max_per_pass, ...}
+    our_stats: {'atk', 'spy_off', 'gold', 'turns', 'level', ...}
+    cfg: battle config dict. Recognised keys:
+        margin         — minimum atk/def ratio (float, default 1.2)
+        skip_friends   — skip marked-friend rows (bool, default True)
+        skip_clan      — skip clanmates (bool, default True)
+        skip_bots      — skip [BOT] rows (bool, default False)
+        max_per_pass   — max targets returned per call (int, default 20)
+        farm_mode      — "gold" (default), "xp", or "match":
+                         • "gold"  = richest target first (def desc tiebreaker)
+                         • "xp"    = highest-XP-per-turn first, proxied by
+                                     (target level - our level)
+                         • "match" = strongest-beatable target first. The
+                                     margin filter already guarantees
+                                     safety, so sorting by est_def DESC
+                                     picks the hardest fight we can still
+                                     win — uses our atk efficiently on
+                                     challenge-matched fights instead of
+                                     overkilling weak bots.
+        min_gold       — attack-mode gold threshold. Targets carrying less
+                         than this much gold on hand are skipped entirely.
+                         Ignored in xp mode unless explicitly set.
     mode: 'attack' or 'spy'
     spy_cooldown: optional set of player names we've successfully spied
         within the last SPY_COOLDOWN_HOURS — filtered out in spy mode
@@ -2895,25 +2730,60 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
     skip_clan    = bool(cfg.get("skip_clan",    True))
     skip_bots    = bool(cfg.get("skip_bots",    False))
     max_per_pass = int(cfg.get("max_per_pass",  20)) or 20
+    farm_mode    = (cfg.get("farm_mode", "gold") or "gold").lower()
+    try:
+        min_gold = int(cfg.get("min_gold", 0) or 0)
+    except (TypeError, ValueError):
+        min_gold = 0
 
     our_atk     = int(our_stats.get("atk",     0))
     our_spy_off = int(our_stats.get("spy_off", 0))
     our_gold    = int(our_stats.get("gold",    0))
     our_turns   = int(our_stats.get("turns",   0))
+    our_level   = int(our_stats.get("level",   1) or 1)
 
     cooldown_set = set(spy_cooldown) if spy_cooldown else set()
+
+    # Filter telemetry — when the result list ends up empty, the caller
+    # can use this to explain WHY and suggest which setting to loosen.
+    reasons = {
+        "out_of_range":   0,
+        "friend":         0,
+        "clan":           0,
+        "bot":            0,
+        "daily_cap_5_5":  0,
+        "under_min_gold": 0,
+        "no_def_est":     0,
+        "margin_fail":    0,
+        "spy_cooldown":   0,
+        "spy_no_def_est": 0,
+        "spy_margin_fail":0,
+    }
 
     safe = []
     for r in rows:
         if not r.get("in_range", True):
+            reasons["out_of_range"] += 1
             continue
         if skip_friends and r.get("is_friend"):
+            reasons["friend"] += 1
             continue
         if skip_clan and r.get("is_clan"):
+            reasons["clan"] += 1
             continue
         if skip_bots and r.get("is_bot"):
+            reasons["bot"] += 1
             continue
         if r.get("attack_count", 0) >= BATTLE_DAILY_MAX:
+            reasons["daily_cap_5_5"] += 1
+            continue
+
+        # Gold threshold — skip targets too poor to bother with. Applies
+        # to attack mode only (spy mode has its own gold floor via cost).
+        # In XP farming we usually care about levels, not wallets — if the
+        # user hasn't set min_gold explicitly we let everything through.
+        if mode == "attack" and min_gold > 0 and int(r.get("gold", 0) or 0) < min_gold:
+            reasons["under_min_gold"] += 1
             continue
 
         # estimates CSV keys by player NAME (no PlayerID column), so join there.
@@ -2922,8 +2792,10 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
         if mode == "attack":
             est_def = int(est.get("est_def", 0))
             if est_def <= 0:
+                reasons["no_def_est"] += 1
                 continue   # unknown defense → unsafe by default
             if our_atk < int(est_def * margin):
+                reasons["margin_fail"] += 1
                 continue
             r["est_def"] = est_def
             r["atk_ratio"] = our_atk / max(est_def, 1)
@@ -2932,23 +2804,84 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
             # Persistent cooldown: if we successfully spied this name within
             # the last SPY_COOLDOWN_HOURS, skip.  Cross-session.
             if name_clean in cooldown_set:
+                reasons["spy_cooldown"] += 1
                 continue
             if our_gold  < SPY_GOLD_COST:  continue
             if our_turns < SPY_TURNS_COST: continue
             est_sd = int(est.get("est_spy_def", 0))
             if est_sd <= 0:
+                reasons["spy_no_def_est"] += 1
                 continue
             if our_spy_off < int(est_sd * margin):
+                reasons["spy_margin_fail"] += 1
                 continue
             r["est_spy_def"] = est_sd
             r["spy_ratio"] = our_spy_off / max(est_sd, 1)
             safe.append(r)
 
     if mode == "attack":
-        safe.sort(key=lambda x: (-x.get("gold", 0), -x.get("fort_pct", 0)))
+        if farm_mode == "match":
+            # Challenge-matched: pick the STRONGEST target we can still
+            # safely beat first. The filter above already enforces
+            # est_def <= our_atk / margin, so every surviving row is a
+            # safe fight — sorting by est_def DESC then gives us the
+            # hardest beatable fight, which maximizes:
+            #   • XP per attack (harder target → more XP)
+            #   • Gold ceiling (stronger players are usually richer
+            #     over time, even if their wallet is empty RIGHT NOW)
+            #   • Efficient use of our atk (no overkill on def-83 bots)
+            # Ties broken by gold (rich beats poor) then fort_pct.
+            safe.sort(key=lambda x: (
+                -int(x.get("est_def",  0) or 0),
+                -int(x.get("gold",     0) or 0),
+                -int(x.get("fort_pct", 0) or 0),
+            ))
+        elif farm_mode == "xp":
+            # Estimate XP gain per attack. DarkThrone awards more XP when
+            # the target is higher-level than you, so target_level - our_level
+            # is a good proxy. Floor at 1 so equal/lower-level targets still
+            # rank above nothing. Secondary sort is est_def DESC (harder
+            # fights at the same level give more XP), then gold.
+            for t in safe:
+                tl = int(t.get("level", 0) or 0)
+                t["xp_score"] = max(1, tl - our_level + 5)
+            safe.sort(key=lambda x: (
+                -x.get("xp_score", 0),
+                -int(x.get("est_def", 0) or 0),
+                -x.get("gold", 0),
+                -x.get("fort_pct", 0),
+            ))
+        else:  # "gold"
+            # Richest target first, but tie-break by est_def DESC so a
+            # stronger target beats a weaker one when they're sitting on
+            # the same pile of gold. This prevents the bot from farming
+            # the same def-83 bot over and over just because they
+            # regenerate gold quickly.
+            safe.sort(key=lambda x: (
+                -x.get("gold", 0),
+                -int(x.get("est_def", 0) or 0),
+                -x.get("fort_pct", 0),
+            ))
     else:
         safe.sort(key=lambda x: (-x.get("gold", 0), -x.get("spy_ratio", 0)))
-    return safe[:max_per_pass]
+
+    # Stash telemetry on the result list so the caller can log WHY
+    # there are no safe targets. Using a list subclass would be cleaner
+    # but setattr works fine for our one-tick use case.
+    result = safe[:max_per_pass]
+    try:
+        # Lists can't carry attributes, so return a small wrapper instead
+        # when the caller needs the reasons. Callers that don't use it
+        # still iterate / slice it like a list.
+        class _PickResult(list):
+            reasons = {}
+            pool_size = 0
+        wrapped = _PickResult(result)
+        wrapped.reasons   = reasons
+        wrapped.pool_size = len(rows)
+        return wrapped
+    except Exception:
+        return result
 
 
 # ── Action executors ─────────────────────────────────────────────────────────
@@ -3122,6 +3055,74 @@ INTEL_COLUMNS = [
     "FortHP", "FortMax", "Notes",
 ]
 
+# Intel rows older than this are ignored by load_intel_overlay() — stats
+# change fast in PvP so anything older than a day is considered stale.
+# Bumped from 6h → 24h after confirming fresh intel (~4h old) was still
+# matching live in-game leaderboards exactly.
+INTEL_MAX_AGE_HOURS = 24
+
+# record_intel() prunes rows older than this on every append. Keeps the
+# file bounded without losing recent history, and avoids the load loops
+# having to iterate thousands of dead rows from old sessions.
+INTEL_RETENTION_DAYS = 7
+
+# Cutoff used by calibrate_models() when collecting rank-model anchor
+# points from the merged CONFIRMED_STATS + intel dict. Players grow
+# every tick, so a 1-week-old "confirmed" snapshot is already stale —
+# feeding it to the exponential fit drags the whole rank curve down
+# and makes the top end underestimate. Anything older than this (or
+# lacking a timestamp entirely) is NOT used for calibration, but it's
+# still used as a FLOOR in estimate() via max(confirmed, model).
+CALIBRATION_FRESH_HOURS = 48
+
+# ── Player growth tracking ─────────────────────────────────────────────
+# Every tick, each player earns income and spends it on troops/gear/
+# buildings.  By recording per-player stat estimates over time we can
+# compute a growth rate and PROJECT current stats forward — so the
+# auto-battle targeting uses predicted-NOW instead of stale-yesterday.
+#
+# NOTE: constant named PLAYER_GROWTH_FILE (not GROWTH_FILE) because
+# GROWTH_FILE at line 36 already refers to the OWN-player tick history
+# (private_optimizer_growth.json). Re-assigning that name here would
+# silently hijack record_growth() and destroy the per-tick chart data.
+PLAYER_GROWTH_FILE      = "private_player_growth.csv"
+PLAYER_GROWTH_COLUMNS   = [
+    "Timestamp", "Player", "Level",
+    "EstATK", "EstDEF", "EstSpyOff", "EstSpyDef",
+    "EstIncome", "Confidence", "Source",
+]
+PLAYER_GROWTH_RETENTION_DAYS    = 14    # prune rows older than this on every append
+PLAYER_GROWTH_MIN_OBSERVATIONS  = 2     # need ≥2 data points to compute a rate
+PLAYER_GROWTH_WINDOW_TICKS      = 336   # 7 days × 48 ticks/day — rate window
+
+# ── Phase 4: projection-vs-intel feedback loop ─────────────────────────────
+# Every tick the estimator publishes a projected ATK/DEF/spy for each player
+# (via estimate()).  When a fresh spy report later lands on that same player
+# we can pair the two — projection at time T, actual at time T' — and compute
+# an error %.  Accumulated over many pairs this teaches us:
+#   • WHICH players have stable predictions (we can trust their estimate)
+#   • WHICH (race, class) buckets have drift (the generic model is wrong for
+#     that build archetype, so lower its confidence)
+#   • WHICH stat channels the model systematically misses (e.g. spy_def may
+#     consistently under-predict because we don't model Spy Academy well)
+#
+# The output feeds `conf_score` on every estimate dict so the dashboard can
+# show "Carrot estimate confidence: 78%" instead of a single CONF/UPPER
+# label.  Also feeds battle targeting — only attack when conf_score is high
+# enough to trust the def estimate.
+PROJECTION_LOG_FILE         = "private_projection_log.csv"
+PROJECTION_LOG_COLUMNS      = [
+    "Timestamp", "Player", "Level", "Race", "Class",
+    "ProjATK", "ProjDEF", "ProjSpyOff", "ProjSpyDef", "ConfLabel",
+]
+PROJECTION_RETENTION_DAYS   = 7      # 14 days of projections is overkill; we
+                                     # only use the last few days anyway
+# Live (in-memory, rebuilt per tick inside calibrate_models) — consumed by
+# estimate() to stamp conf_score on each player's return dict.
+PROJECTION_ERRORS_LIVE: dict = {}    # {player: {atk_err_pct, def_err_pct, ..., samples}}
+BUCKET_ERRORS_LIVE:     dict = {}    # {(race, cls): {atk_err_pct_median, ..., samples}}
+
+
 def _page_text(page) -> str:
     """Return the page body text, flattened for regex matching.
 
@@ -3220,11 +3221,25 @@ def parse_spy_report(page) -> dict:
     with target_name / target_level / target_race / target_class / target_atk
     / target_def / target_spy_off / target_spy_def / target_gold / target_bank
     / target_citizens / target_fort_hp / target_fort_max / xp_gained /
-    army unit counts / result."""
+    army unit counts / result.
+
+    Handles two page formats:
+      - FRESH spy result ("Operation Successful / Intel gathered successfully - Name !")
+      - HISTORICAL log entry ("Intelligence Report: Name")
+    The historical form is what you get when you navigate to an old
+    /game/spy/log/{id} URL from the Spy Logs history list — same stat
+    block, different headline.
+    """
     text = _page_text(page)
     out = {"source": "spy"}
 
-    if "Operation Successful" in text or "Intel gathered successfully" in text:
+    fresh_success = ("Operation Successful" in text
+                     or "Intel gathered successfully" in text)
+    historical    = bool(re.search(r"Intelligence\s+Report\s*:", text))
+    has_stat_block = bool(re.search(
+        r"Total\s+Offense\s+[\d,]+\s+Total\s+Defense\s+[\d,]+", text))
+
+    if fresh_success or (historical and has_stat_block):
         out["result"] = "spy_ok"
     elif re.search(r"(operation|spy|recon)\s+(failed|unsuccessful)|caught|detected|alerted", text, re.I):
         out["result"] = "spy_fail"
@@ -3234,8 +3249,17 @@ def parse_spy_report(page) -> dict:
     if out["result"] != "spy_ok":
         return out   # failed / unknown spies don't reveal the stat block
 
-    # "Intel gathered successfully - <Name> !"
+    # Target name lives in one of two places depending on format:
+    #   FRESH:      "Intel gathered successfully - <Name> !"
+    #   HISTORICAL: "Intelligence Report: <Name>  Date: <...>"
+    # (The historical form's name is terminated by "Date:" or by the
+    # end-of-line — match non-greedy and stop before those sentinels.)
     m = re.search(r"Intel\s+gathered\s+successfully\s*-\s*(.+?)\s*[!\?]", text)
+    if not m:
+        m = re.search(
+            r"Intelligence\s+Report\s*:\s*(.+?)\s+Date\s*:",
+            text
+        )
     if m:
         out["target_name"] = m.group(1).strip()
 
@@ -3278,7 +3302,14 @@ def parse_spy_report(page) -> dict:
     if m: out["target_gold"] = _parse_kmb(m.group(1))
     m = re.search(r"Gold\s+in\s+Bank\s+([\d\.,]+\s*[KkMmBb]?)", text)
     if m: out["target_bank"] = _parse_kmb(m.group(1))
-    m = re.search(r"Citizens\s+([\d,]+)", text)
+    # Citizens — match AFTER "Gold in Bank ..." so we don't grab the
+    # nav-bar's "Gold 0 Citizens X Turns ..." string that appears earlier
+    # in the flattened page text. A bare /Citizens (\d+)/ will pick up my
+    # navbar value (~3000) instead of the target's idle count.
+    m = re.search(
+        r"Gold\s+in\s+Bank\s+[\d\.,]+\s*[KkMmBb]?\s+Citizens\s+([\d,]+)",
+        text
+    )
     if m: out["target_citizens"] = num(m.group(1))
 
     # Army composition.  "Spy Offense" / "Spy Defense" as role labels COLLIDE
@@ -3297,6 +3328,11 @@ def parse_spy_report(page) -> dict:
                 tail = tail[:s]
                 break
         army_text = tail
+    # Flat count regex — preserved for backward compat with any consumer
+    # that reads target_workers/soldiers/etc. scalars.  The rich-row
+    # regex below ALSO populates these same keys when it matches; the
+    # flat regex is the fallback for reports where the rich pattern
+    # (Tn + unit name + role + qty + bonus + total) isn't present.
     for role, key in [
         ("Workers",            "target_workers"),
         ("Offensive Military", "target_soldiers"),
@@ -3308,7 +3344,311 @@ def parse_spy_report(page) -> dict:
         if m:
             out[key] = num(m.group(1))
 
+    # Rich-row army parse (Phase 3): full "Tn <UnitName> <Role> <Qty> <Bonus> <Total>"
+    # match gives us per-unit stat (the Bonus column), which we need to
+    # reconstruct exact ATK/DEF in estimate() when rich intel is fresh.
+    # Role strings collide with stat labels so we work within the sliced
+    # army_text only (same approach as the flat parser above).
+    ARMY_ROLES = (
+        "Offensive Military", "Defensive Military",
+        "Spy Offense",        "Spy Defense",
+        "Workers",
+    )
+    role_to_key = {
+        "Workers":            "workers",
+        "Offensive Military": "soldiers",
+        "Defensive Military": "guards",
+        "Spy Offense":        "spies",
+        "Spy Defense":        "sentries",
+    }
+    army_pat = re.compile(
+        r"T(\d+)\s+"
+        r"([A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,3}?)\s+"
+        rf"({'|'.join(re.escape(r) for r in ARMY_ROLES)})\s+"
+        r"([\d,]+)\s+([\d,]+)\s+([\d,]+)"
+    )
+    army_detail: dict = {}
+    for mm in army_pat.finditer(army_text):
+        tier = int(mm.group(1))
+        unit = mm.group(2).strip()
+        role = mm.group(3).strip()
+        qty  = num(mm.group(4))
+        bonus_per_unit = num(mm.group(5))
+        total = num(mm.group(6))
+        key = role_to_key.get(role, role.lower().replace(" ", "_"))
+        army_detail[key] = {
+            "tier":  tier,
+            "unit":  unit,
+            "qty":   qty,
+            "bonus": bonus_per_unit,   # per-unit stat contribution
+            "total": total,            # qty × bonus (sanity-check field)
+        }
+    if army_detail:
+        out["target_army_detail"] = army_detail
+
+    # ── Armory Inventory ────────────────────────────────────────────────
+    # Spy page shows a table: Tn <Item Name> <Category> <Qty> <Bonus> <Total>
+    # where <Category> is one of 8 known strings.  Slice the text between
+    # "Armory Inventory" and the next section ("Buildings") so item-name
+    # regex can't run past the boundary.  The per-row regex anchors on the
+    # category string (longest-first in an alternation to avoid prefix
+    # collisions — "Spy Defense Armor" must match before "Defense Armor").
+    armory_text = ""
+    idx = text.find("Armory Inventory")
+    if idx >= 0:
+        tail = text[idx:]
+        for stop in ("Buildings", "Battle Upgrades", "Share this intel"):
+            s = tail.find(stop)
+            if s > 0:
+                tail = tail[:s]
+                break
+        armory_text = tail
+
+    ARMORY_CATEGORIES = (
+        "Spy Offense Weapons", "Spy Offense Armor",
+        "Spy Defense Weapons", "Spy Defense Armor",
+        "Offense Weapons",     "Offense Armor",
+        "Defense Weapons",     "Defense Armor",
+    )
+    armory: dict = {}
+    if armory_text:
+        cat_alt = "|".join(re.escape(c) for c in ARMORY_CATEGORIES)
+        # T<tier> <Item Words> <Category> <Qty> <Bonus> <Total>
+        # Item name is 1-4 words starting with an uppercase letter.  The
+        # non-greedy quantifier + category anchor means we always stop at
+        # the right category boundary even if the item name contains
+        # ambiguous words.
+        pat = re.compile(
+            r"T(\d+)\s+([A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,3}?)\s+"
+            rf"({cat_alt})\s+([\d,]+)\s+([\d,]+)\s+([\d,]+)"
+        )
+        for mm in pat.finditer(armory_text):
+            tier  = int(mm.group(1))
+            item  = mm.group(2).strip()
+            cat   = mm.group(3).strip()
+            qty   = num(mm.group(4))
+            bonus = num(mm.group(5))
+            total = num(mm.group(6))
+            armory[item] = {
+                "tier":     tier,
+                "category": cat,
+                "qty":      qty,
+                "bonus":    bonus,   # per-item stat contribution
+                "total":    total,   # qty × bonus (sanity-check field)
+            }
+    if armory:
+        out["target_armory"] = armory
+
+    # ── Buildings ────────────────────────────────────────────────────────
+    # "<Name> Level <N>" for each of 7 known buildings.  Anchor on known
+    # names (closed set) to avoid matching "Level N" strings from other
+    # contexts (e.g. the player's "Level 29" in demographics).
+    BUILDING_NAMES = (
+        "Fortification", "Armory", "Mine", "Spy Academy",
+        "Barracks", "Housing", "Mercenary Camp",
+    )
+    buildings_text = ""
+    idx = text.find(" Buildings ")   # leading space avoids matching "Buildings" inside other words
+    if idx < 0:
+        # Fallback: plain find.  We rely on the section being distinct enough.
+        idx = text.find("Buildings")
+    if idx >= 0:
+        tail = text[idx:]
+        for stop in ("Battle Upgrades", "Share this intel"):
+            s = tail.find(stop)
+            if s > 0:
+                tail = tail[:s]
+                break
+        buildings_text = tail
+
+    buildings: dict = {}
+    if buildings_text:
+        name_alt = "|".join(re.escape(n) for n in BUILDING_NAMES)
+        for mm in re.finditer(
+            rf"({name_alt})\s+Level\s+(\d+)", buildings_text
+        ):
+            # snake_case the building name for stable JSON keys
+            bname = mm.group(1).lower().replace(" ", "_")
+            buildings[bname] = int(mm.group(2))
+    if buildings:
+        out["target_buildings"] = buildings
+
+    # ── Battle Upgrades ──────────────────────────────────────────────────
+    # Table: <Upgrade Name> Battle Upgrades - <Kind> <Qty> <Bonus>
+    # Where <Kind> ∈ {Offense, Defense, Spy}.  Kind doubles as the stat
+    # channel the upgrade boosts.
+    upgrades_text = ""
+    idx = text.find("Battle Upgrades")
+    if idx >= 0:
+        # Skip past the section header itself (the page has "Battle Upgrades"
+        # as a label AND as part of each row's category cell) — start the
+        # slice AFTER the last column header ("BONUS") so the upgrade-name
+        # regex can't capture header words like "BONUS Steed" as a name.
+        tail = text[idx:]
+        hdr = tail.find("BONUS")
+        if 0 < hdr < 200:
+            # Advance past "BONUS" itself so the regex starts at the first
+            # data row's upgrade name.
+            tail = tail[hdr + len("BONUS"):]
+        for stop in ("Share this intel", "Report abuse"):
+            s = tail.find(stop)
+            if s > 0:
+                tail = tail[:s]
+                break
+        upgrades_text = tail
+
+    upgrades: dict = {}
+    if upgrades_text:
+        pat = re.compile(
+            r"([A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,3}?)\s+"
+            r"Battle\s+Upgrades\s*-\s*(Offense|Defense|Spy)\s+"
+            r"([\d,]+)\s+([\d,]+)"
+        )
+        for mm in pat.finditer(upgrades_text):
+            uname = mm.group(1).strip()
+            upgrades[uname] = {
+                "kind":  mm.group(2),   # Offense | Defense | Spy
+                "qty":   num(mm.group(3)),
+                "bonus": num(mm.group(4)),
+            }
+    if upgrades:
+        out["target_upgrades"] = upgrades
+
     return out
+
+
+# ── Rich per-target intel snapshot ────────────────────────────────────────
+# private_target_intel.json is a companion to private_intel.csv.  The CSV is
+# append-only (historical audit log), bounded by INTEL_RETENTION_DAYS.  The
+# JSON is latest-per-player (keyed by name), storing everything the spy-report
+# parser found — including nested dicts (army / armory / buildings / upgrades)
+# that don't fit the flat CSV schema.  Consumers that need full context
+# (estimate(), growth-model trainer) read the JSON; consumers that only need
+# recent combat stats keep reading the CSV.
+TARGET_INTEL_FILE            = "private_target_intel.json"
+TARGET_INTEL_RETENTION_HOURS = 24 * 14   # 14 days — matches CSV retention
+
+
+def load_target_intel_snapshot() -> dict:
+    """Load {player_name: rich_intel_dict} from private_target_intel.json.
+    Returns {} if the file is missing or unparseable — never raises."""
+    path = TARGET_INTEL_FILE
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_target_intel_snapshot(snap: dict) -> None:
+    """Atomic write of the full snapshot back to disk, pruning entries older
+    than TARGET_INTEL_RETENTION_HOURS so stale data doesn't pile up."""
+    if not isinstance(snap, dict):
+        return
+    cutoff = datetime.datetime.now() - datetime.timedelta(hours=TARGET_INTEL_RETENTION_HOURS)
+    pruned = {}
+    for name, rec in snap.items():
+        ts = (rec or {}).get("captured_at", "")
+        row_dt = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                row_dt = datetime.datetime.strptime(ts, fmt)
+                break
+            except (ValueError, TypeError):
+                pass
+        if row_dt is None or row_dt >= cutoff:
+            pruned[name] = rec
+    _unhide(TARGET_INTEL_FILE)
+    tmp = TARGET_INTEL_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(pruned, f, indent=2, ensure_ascii=False, sort_keys=True)
+    os.replace(tmp, TARGET_INTEL_FILE)
+
+
+def record_target_intel(entry: dict) -> None:
+    """Merge one parse_*_report() dict into the rich snapshot.  Latest per
+    player wins — the key is the target name, and every call overwrites any
+    prior entry for that player.  Kept deliberately small: canonicalize the
+    entry into a fixed shape, then persist.  Callers should have already
+    CSV-recorded the same entry via record_intel()."""
+    name = (entry.get("target_name") or "").strip()
+    if not name:
+        return
+    ts   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    snap = load_target_intel_snapshot()
+
+    # Canonical shape — strip the "target_" prefix to match in-code
+    # field names used by calibrate_models / estimate.  Missing scalar
+    # fields are omitted (not zeroed) so a sparse report doesn't overwrite
+    # an earlier richer capture with blanks.
+    rec: dict = {
+        "captured_at": ts,
+        "source":      entry.get("source", "spy"),
+    }
+    for src_key, dst_key in (
+        ("target_level",    "level"),
+        ("target_race",     "race"),
+        ("target_class",    "cls"),
+        ("target_fort_hp",  "fort_hp"),
+        ("target_fort_max", "fort_max"),
+        ("target_atk",      "atk"),
+        ("target_def",      "def"),
+        ("target_spy_off",  "spy_off"),
+        ("target_spy_def",  "spy_def"),
+        ("target_gold",     "gold"),
+        ("target_bank",     "bank"),
+        ("target_citizens", "citizens"),
+    ):
+        v = entry.get(src_key)
+        if v not in (None, "", 0):   # skip blanks/zeros (sparse-report safety)
+            rec[dst_key] = v
+
+    # Army composition — only include fields that were actually present
+    # in the entry, so a minimal attack report doesn't clobber a rich spy
+    # snapshot from hours ago.
+    army = {}
+    for src_key, dst_key in (
+        ("target_workers",  "workers"),
+        ("target_soldiers", "soldiers"),
+        ("target_guards",   "guards"),
+        ("target_spies",    "spies"),
+        ("target_sentries", "sentries"),
+    ):
+        if src_key in entry and entry[src_key] not in (None, ""):
+            army[dst_key] = int(entry[src_key])
+    if army:
+        rec["army"] = army
+
+    # Nested rich fields — copy only when present
+    if entry.get("target_armory"):      rec["armory"]      = dict(entry["target_armory"])
+    if entry.get("target_buildings"):   rec["buildings"]   = dict(entry["target_buildings"])
+    if entry.get("target_upgrades"):    rec["upgrades"]    = dict(entry["target_upgrades"])
+    if entry.get("target_army_detail"): rec["army_detail"] = dict(entry["target_army_detail"])
+
+    # Merge-in rather than replace: preserve prior rich fields when this
+    # capture is sparser (e.g. an attack report after a fresh spy).  The
+    # sparse-report safety above means scalars don't get overwritten with
+    # zeros — but we still want to KEEP the prior armory/buildings if the
+    # new entry doesn't include them.
+    prior = snap.get(name) or {}
+    merged = dict(prior)
+    merged.update(rec)    # new scalar fields overwrite old ones
+    # Nested dicts: keep prior nested data if new entry didn't supply it
+    for nest in ("army", "armory", "buildings", "upgrades", "army_detail"):
+        if nest in rec:
+            merged[nest] = rec[nest]
+        elif nest in prior:
+            merged[nest] = prior[nest]
+
+    snap[name] = merged
+    try:
+        save_target_intel_snapshot(snap)
+    except Exception:
+        # Never let snapshot-write failure block the rest of the intel pipe.
+        pass
 
 
 def record_intel(entry: dict, log_fn=None) -> None:
@@ -3342,11 +3682,60 @@ def record_intel(entry: dict, log_fn=None) -> None:
     ]
     _unhide(INTEL_FILE)
     new = not os.path.isfile(INTEL_FILE)
+
+    # Prune rows older than INTEL_RETENTION_DAYS days BEFORE appending, so
+    # the file stays bounded. We keep the header + every row newer than
+    # the cutoff, atomic-replace, then append the new row below.
+    if not new:
+        try:
+            cutoff = datetime.datetime.now() - datetime.timedelta(days=INTEL_RETENTION_DAYS)
+            kept, dropped = [], 0
+            with open(INTEL_FILE, "r", encoding="utf-8") as rf:
+                rd = csv.DictReader(rf)
+                header = rd.fieldnames or INTEL_COLUMNS
+                for r in rd:
+                    ts_str = (r.get("Timestamp") or "").strip()
+                    row_dt = None
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                        try:
+                            row_dt = datetime.datetime.strptime(ts_str, fmt)
+                            break
+                        except ValueError:
+                            pass
+                    if row_dt is not None and row_dt < cutoff:
+                        dropped += 1
+                        continue
+                    kept.append(r)
+            if dropped > 0:
+                tmp = INTEL_FILE + ".tmp"
+                with open(tmp, "w", newline="", encoding="utf-8") as wf:
+                    w = csv.DictWriter(wf, fieldnames=header)
+                    w.writeheader()
+                    w.writerows(kept)
+                os.replace(tmp, INTEL_FILE)
+                if log_fn:
+                    log_fn(f"  🧹 pruned {dropped} intel row(s) >{INTEL_RETENTION_DAYS}d old", "dim")
+        except Exception as e:
+            # Never let pruning failure block new-row append.
+            if log_fn:
+                log_fn(f"  ⚠️  intel prune skipped: {e}", "dim")
+
     with open(INTEL_FILE, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if new:
             w.writerow(INTEL_COLUMNS)
         w.writerow(row)
+
+    # Also merge into the rich per-target snapshot (Phase 1).  Carries any
+    # nested fields (army / armory / buildings / upgrades) that the CSV
+    # can't store.  Best-effort: snapshot-write failure never blocks the
+    # CSV-based pipeline that every existing consumer depends on.
+    try:
+        record_target_intel(entry)
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ⚠️  rich-intel snapshot update failed: {e}", "dim")
+
     if log_fn:
         src  = entry.get("source", "?")
         name = entry.get("target_name", "?")
@@ -3356,8 +3745,469 @@ def record_intel(entry: dict, log_fn=None) -> None:
         if "target_atk"     in entry: bits.append(f"atk={int(entry['target_atk']):,}")
         if "target_spy_off" in entry: bits.append(f"spy_off={int(entry['target_spy_off']):,}")
         if "target_spy_def" in entry: bits.append(f"spy_def={int(entry['target_spy_def']):,}")
+        # Indicate when we captured rich data on this pass
+        rich_bits = []
+        if entry.get("target_armory"):    rich_bits.append(f"armory={len(entry['target_armory'])}")
+        if entry.get("target_buildings"): rich_bits.append(f"buildings={len(entry['target_buildings'])}")
+        if entry.get("target_upgrades"):  rich_bits.append(f"upgrades={len(entry['target_upgrades'])}")
+        if rich_bits:
+            bits.append("rich=[" + " ".join(rich_bits) + "]")
         detail = "  ".join(bits) if bits else "no numbers"
         log_fn(f"  🛰  intel({src}) {name}: {detail}", "dim")
+
+    # Also record this intel observation in the growth CSV so we get
+    # exact data points for growth-rate computation. Intel readings are
+    # the MOST reliable growth signal — two spies on the same player at
+    # different times give an exact delta.
+    if entry.get("target_name") and (entry.get("target_def") or entry.get("target_atk")):
+        try:
+            record_player_growth([{
+                "Player":     entry["target_name"],
+                "Level":      entry.get("target_level", ""),
+                "EstATK":     entry.get("target_atk",    0),
+                "EstDEF":     entry.get("target_def",    0),
+                "EstSpyOff":  entry.get("target_spy_off", 0),
+                "EstSpyDef":  entry.get("target_spy_def", 0),
+                "EstIncome":  0,
+                "Confidence": "INTEL",
+            }], source="intel")
+        except Exception:
+            pass  # growth recording must never block intel recording
+
+
+# ── Player growth tracking ─────────────────────────────────────────────────
+# Same pattern as own-player growth (private_optimizer_growth.json) but for
+# EVERY tracked player.  Append-only CSV, bounded by PLAYER_GROWTH_RETENTION_DAYS.
+# Two data sources feed it:
+#   1. estimator_run() → one row per player per tick (model estimates)
+#   2. record_intel()  → one row per spy/attack report (exact observations)
+# load_estimates_lookup() reads it back, computes per-player growth rates,
+# and projects stats forward so the auto-battle uses predicted-NOW numbers.
+
+def record_player_growth(results: list, source: str = "estimate") -> None:
+    """Append player stat observations to the rolling growth CSV.
+
+    results: list of dicts, each must have at least 'Player'. Keys consumed:
+      Player, Level, EstATK, EstDEF, EstSpyOff, EstSpyDef, EstIncome, Confidence
+    source: 'estimate' (from estimator_run) or 'intel' (from spy/attack report)
+    """
+    if not results:
+        return
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── Prune rows older than PLAYER_GROWTH_RETENTION_DAYS ────────
+    _unhide(PLAYER_GROWTH_FILE)
+    if os.path.isfile(PLAYER_GROWTH_FILE):
+        try:
+            cutoff = datetime.datetime.now() - datetime.timedelta(days=PLAYER_GROWTH_RETENTION_DAYS)
+            kept, dropped = [], 0
+            with open(PLAYER_GROWTH_FILE, "r", encoding="utf-8") as rf:
+                rd = csv.DictReader(rf)
+                for r in rd:
+                    ts_str = (r.get("Timestamp") or "").strip()
+                    row_dt = None
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                        try:
+                            row_dt = datetime.datetime.strptime(ts_str, fmt)
+                            break
+                        except ValueError:
+                            pass
+                    if row_dt is not None and row_dt < cutoff:
+                        dropped += 1
+                        continue
+                    kept.append(r)
+            if dropped > 0:
+                tmp = PLAYER_GROWTH_FILE + ".tmp"
+                with open(tmp, "w", newline="", encoding="utf-8") as wf:
+                    w = csv.DictWriter(wf, fieldnames=PLAYER_GROWTH_COLUMNS)
+                    w.writeheader()
+                    w.writerows(kept)
+                os.replace(tmp, PLAYER_GROWTH_FILE)
+        except Exception:
+            pass  # pruning failure must never block the append
+
+    # ── Append new rows ────────────────────────────────────────────
+    new_file = not os.path.isfile(PLAYER_GROWTH_FILE)
+    with open(PLAYER_GROWTH_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(PLAYER_GROWTH_COLUMNS)
+        for r in results:
+            name = (r.get("Player") or "").strip()
+            if not name or "(YOU)" in name:
+                continue
+            w.writerow([
+                ts,
+                name,
+                r.get("Level", ""),
+                r.get("EstATK",    0),
+                r.get("EstDEF",    0),
+                r.get("EstSpyOff", 0),
+                r.get("EstSpyDef", 0),
+                r.get("EstIncome") or r.get("EstIncomeTick") or 0,
+                r.get("Confidence", ""),
+                source,
+            ])
+
+
+def load_player_growth() -> dict:
+    """Read the growth CSV and return per-player time series.
+
+    Returns {Player: [{"ts": datetime, "atk": int, "def": int,
+                        "spy_off": int, "spy_def": int, "source": str}, ...]}
+    sorted by timestamp ascending per player.
+    Only rows within the last PLAYER_GROWTH_WINDOW_TICKS ticks (~7 days) are loaded.
+    """
+    if not os.path.isfile(PLAYER_GROWTH_FILE):
+        return {}
+    cutoff = datetime.datetime.now() - datetime.timedelta(
+        minutes=PLAYER_GROWTH_WINDOW_TICKS * 30)
+    growth = {}
+    try:
+        with open(PLAYER_GROWTH_FILE, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                name = (row.get("Player") or "").strip()
+                if not name:
+                    continue
+                ts_str = (row.get("Timestamp") or "").strip()
+                row_dt = None
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                    try:
+                        row_dt = datetime.datetime.strptime(ts_str, fmt)
+                        break
+                    except ValueError:
+                        pass
+                if row_dt is None or row_dt < cutoff:
+                    continue
+                entry = {
+                    "ts":      row_dt,
+                    "atk":     int(row.get("EstATK", 0) or 0),
+                    "def":     int(row.get("EstDEF", 0) or 0),
+                    "spy_off": int(row.get("EstSpyOff", 0) or 0),
+                    "spy_def": int(row.get("EstSpyDef", 0) or 0),
+                    "source":  (row.get("Source") or "").strip(),
+                }
+                growth.setdefault(name, []).append(entry)
+    except Exception as e:
+        print(f"  ⚠️  load_player_growth failed: {e}")
+    # Sort each player's series by timestamp
+    for series in growth.values():
+        series.sort(key=lambda x: x["ts"])
+    return growth
+
+
+def compute_growth_rates(growth: dict) -> dict:
+    """Compute per-player stat growth rates from historical observations.
+
+    For each player with >= PLAYER_GROWTH_MIN_OBSERVATIONS data points, computes
+    a simple linear slope: (latest - earliest) / ticks_between.
+    Negative slopes are clamped to 0 — players don't lose stats in
+    DarkThrone (gear and units are persistent).
+
+    Returns {Player: {
+        "def_per_tick": float, "atk_per_tick": float,
+        "spy_off_per_tick": float, "spy_def_per_tick": float,
+        "last_ts": datetime, "last_def": int, "last_atk": int,
+        "last_spy_off": int, "last_spy_def": int,
+        "observations": int,
+    }}
+    """
+    rates = {}
+    for name, series in growth.items():
+        if len(series) < PLAYER_GROWTH_MIN_OBSERVATIONS:
+            continue
+        first = series[0]
+        last  = series[-1]
+        dt_seconds = (last["ts"] - first["ts"]).total_seconds()
+        if dt_seconds < 1800:
+            continue   # need at least 1 tick of separation
+        ticks = dt_seconds / 1800.0
+
+        # Sanity cap on observed rate — anything above this is almost
+        # certainly bad data (model feedback loop from old bug, or a
+        # player value jump caused by an intel correction). Real DT
+        # growth is at most a few thousand stat per tick even for
+        # top-level players.
+        MAX_PLAUSIBLE_RATE_PER_TICK = 10_000
+
+        def _slope(stat_key):
+            v0 = first.get(stat_key, 0)
+            v1 = last.get(stat_key, 0)
+            if v1 <= 0 or v0 <= 0:
+                return 0.0
+            rate = max(0.0, (v1 - v0) / ticks)
+            if rate > MAX_PLAUSIBLE_RATE_PER_TICK:
+                return 0.0   # discard as noise
+            return rate
+
+        rates[name] = {
+            "def_per_tick":     _slope("def"),
+            "atk_per_tick":     _slope("atk"),
+            "spy_off_per_tick": _slope("spy_off"),
+            "spy_def_per_tick": _slope("spy_def"),
+            "last_ts":          last["ts"],
+            "last_def":         last.get("def", 0),
+            "last_atk":         last.get("atk", 0),
+            "last_spy_off":     last.get("spy_off", 0),
+            "last_spy_def":     last.get("spy_def", 0),
+            "observations":     len(series),
+        }
+    return rates
+
+
+# ── Phase 4: projection log + error feedback ────────────────────────────────
+def record_projections(results: list, log_fn=None) -> None:
+    """Append today's tick projections to private_projection_log.csv.
+
+    One row per player in `results`.  Called at the end of estimator_run()
+    so we have a dated record of what the model predicted.  Later intel
+    captures pair with these rows to compute accuracy deltas.
+    """
+    if not results:
+        return
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for r in results:
+        name = (r.get("Player") or "").strip()
+        if not name:
+            continue
+        rows.append([
+            ts, name,
+            int(r.get("Level",     0) or 0),
+            (r.get("Race")   or "").strip(),
+            (r.get("Class")  or "").strip(),
+            int(r.get("EstATK",    0) or 0),
+            int(r.get("EstDEF",    0) or 0),
+            int(r.get("EstSpyOff", 0) or 0),
+            int(r.get("EstSpyDef", 0) or 0),
+            (r.get("Confidence") or "").strip(),
+        ])
+    if not rows:
+        return
+
+    _unhide(PROJECTION_LOG_FILE)
+    new_file = not os.path.isfile(PROJECTION_LOG_FILE)
+
+    # Prune rows older than PROJECTION_RETENTION_DAYS so the file stays bounded.
+    if not new_file:
+        try:
+            cutoff = datetime.datetime.now() - datetime.timedelta(days=PROJECTION_RETENTION_DAYS)
+            kept, dropped = [], 0
+            with open(PROJECTION_LOG_FILE, "r", encoding="utf-8") as rf:
+                rd = csv.DictReader(rf)
+                header = rd.fieldnames or PROJECTION_LOG_COLUMNS
+                for row in rd:
+                    ts_str = (row.get("Timestamp") or "").strip()
+                    dt = None
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                        try:    dt = datetime.datetime.strptime(ts_str, fmt); break
+                        except ValueError: pass
+                    if dt is not None and dt < cutoff:
+                        dropped += 1
+                        continue
+                    kept.append(row)
+            if dropped > 0:
+                tmp = PROJECTION_LOG_FILE + ".tmp"
+                with open(tmp, "w", newline="", encoding="utf-8") as wf:
+                    w = csv.DictWriter(wf, fieldnames=header)
+                    w.writeheader()
+                    w.writerows(kept)
+                os.replace(tmp, PROJECTION_LOG_FILE)
+                if log_fn:
+                    log_fn(f"  🧹 pruned {dropped} projection row(s) >{PROJECTION_RETENTION_DAYS}d old", "dim")
+        except Exception as e:
+            if log_fn:
+                log_fn(f"  ⚠️  projection prune skipped: {e}", "dim")
+
+    with open(PROJECTION_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(PROJECTION_LOG_COLUMNS)
+        for row in rows:
+            w.writerow(row)
+
+
+def load_projection_log() -> dict:
+    """Read the projection log back as a per-player time-series.
+
+    Returns {player: [{ts, atk, def, spy_off, spy_def, level, race, cls}, ...]}
+    sorted by ts ascending per player.
+    """
+    out: dict = {}
+    if not os.path.isfile(PROJECTION_LOG_FILE):
+        return out
+    try:
+        with open(PROJECTION_LOG_FILE, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                name = (row.get("Player") or "").strip()
+                if not name:
+                    continue
+                ts_str = (row.get("Timestamp") or "").strip()
+                dt = None
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                    try:    dt = datetime.datetime.strptime(ts_str, fmt); break
+                    except ValueError: pass
+                if dt is None:
+                    continue
+                out.setdefault(name, []).append({
+                    "ts":       dt,
+                    "level":    int(row.get("Level",     0) or 0),
+                    "race":     (row.get("Race")  or "").strip(),
+                    "cls":      (row.get("Class") or "").strip(),
+                    "atk":      int(row.get("ProjATK",   0) or 0),
+                    "def":      int(row.get("ProjDEF",   0) or 0),
+                    "spy_off":  int(row.get("ProjSpyOff",0) or 0),
+                    "spy_def":  int(row.get("ProjSpyDef",0) or 0),
+                    "conf":     (row.get("ConfLabel") or "").strip(),
+                })
+    except Exception as e:
+        print(f"  ⚠️  load_projection_log failed: {e}")
+    for series in out.values():
+        series.sort(key=lambda x: x["ts"])
+    return out
+
+
+def compute_projection_errors(proj_log: dict, intel_overlay: dict) -> tuple:
+    """Pair projections-at-time-T with intel captured near time T to compute
+    per-stat error fractions.
+
+    Returns (player_errs, bucket_errs) where:
+      player_errs = {name: {atk_err_pct, def_err_pct, spy_off_err_pct,
+                            spy_def_err_pct, samples, last_checked}}
+      bucket_errs = {(race, cls): {atk_err_pct_median, ..., samples}}
+
+    Pairing logic: for each player with BOTH a projection history and a
+    fresh intel row, find the projection row NEWEST that's still older
+    than the intel's timestamp by more than 1 tick (30 min).  That's the
+    projection the model made which the intel then refuted/confirmed.
+    """
+    player_errs: dict = {}
+    bucket_accumulator: dict = {}   # {(race, cls): {stat: [err_pcts]}}
+
+    now = datetime.datetime.now()
+
+    for name, intel in (intel_overlay or {}).items():
+        if not intel or not isinstance(intel, dict):
+            continue
+        # Parse intel timestamp
+        ts_str = (intel.get("timestamp") or intel.get("captured_at") or "").strip()
+        intel_dt = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:    intel_dt = datetime.datetime.strptime(ts_str, fmt); break
+            except ValueError: pass
+        if intel_dt is None:
+            continue
+
+        # Need actual observed values to compare against
+        actual_atk = int(intel.get("atk", 0)     or 0)
+        actual_def = int(intel.get("def", 0)     or 0)
+        actual_spo = int(intel.get("spy_off", 0) or 0)
+        actual_spd = int(intel.get("spy_def", 0) or 0)
+
+        # Most-recent projection BEFORE the intel was captured
+        series = proj_log.get(name, [])
+        prior = [p for p in series if p["ts"] < intel_dt - datetime.timedelta(minutes=30)]
+        if not prior:
+            continue
+        proj = prior[-1]
+
+        def _err(proj_v, actual_v):
+            if actual_v <= 0 or proj_v <= 0:
+                return None
+            return abs(proj_v - actual_v) / actual_v
+
+        errs = {
+            "atk_err_pct":     _err(proj["atk"],     actual_atk),
+            "def_err_pct":     _err(proj["def"],     actual_def),
+            "spy_off_err_pct": _err(proj["spy_off"], actual_spo),
+            "spy_def_err_pct": _err(proj["spy_def"], actual_spd),
+        }
+        # Drop None entries (stat wasn't observed or wasn't projected)
+        errs = {k: v for k, v in errs.items() if v is not None}
+        if not errs:
+            continue
+        errs["samples"]      = 1
+        errs["last_checked"] = now
+        player_errs[name] = errs
+
+        # Accumulate bucket-level errors
+        race = intel.get("race") or proj.get("race", "")
+        cls  = intel.get("cls")  or proj.get("cls",  "")
+        if race and cls:
+            bkey = (race, cls)
+            buc = bucket_accumulator.setdefault(bkey, {
+                "atk_err_pct": [], "def_err_pct": [],
+                "spy_off_err_pct": [], "spy_def_err_pct": [],
+            })
+            for k in ("atk_err_pct", "def_err_pct", "spy_off_err_pct", "spy_def_err_pct"):
+                if k in errs:
+                    buc[k].append(errs[k])
+
+    # Collapse bucket lists to medians + sample counts
+    bucket_errs: dict = {}
+    for bkey, stats in bucket_accumulator.items():
+        summary = {"samples": 0}
+        for stat_key, vals in stats.items():
+            if not vals:
+                continue
+            s = sorted(vals)
+            n = len(s)
+            med = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+            summary[stat_key + "_median"] = med
+            summary["samples"] = max(summary["samples"], n)
+        if summary["samples"] > 0:
+            bucket_errs[bkey] = summary
+
+    return player_errs, bucket_errs
+
+
+def _confidence_score(name: str, race: str, cls: str,
+                      has_fresh_rich: bool,
+                      has_stale_confirmed: bool,
+                      has_observed_growth: bool) -> float:
+    """Return a confidence score in [0, 1] for an estimate.
+
+    Scoring model:
+        0.30   baseline (rank curve only)
+      + 0.35   fresh rich intel (≤48h) — we just saw current state
+      + 0.15   stale confirmed floor (>48h) — better than rank curve alone
+      + 0.15   known demographics (race, class)
+      + 0.10   observed growth rate (player has ≥2 growth-log entries)
+      - penalty from player-specific projection error history (if any)
+      - smaller penalty from bucket-level error (if player-specific absent)
+    Final value clamped to [0, 1].
+    """
+    score = 0.30
+    if has_fresh_rich:
+        score += 0.35
+    elif has_stale_confirmed:
+        score += 0.15
+    if race and cls:
+        score += 0.15
+    if has_observed_growth:
+        score += 0.10
+
+    # Accuracy penalty: prefer player-specific error data when available,
+    # otherwise fall back to the player's (race, class) bucket.
+    pe = PROJECTION_ERRORS_LIVE.get(name)
+    if pe:
+        # Average across whichever stats we have for this player
+        stat_keys = ("atk_err_pct", "def_err_pct", "spy_off_err_pct", "spy_def_err_pct")
+        errs = [pe[k] for k in stat_keys if k in pe]
+        if errs:
+            avg_err = sum(errs) / len(errs)
+            score -= 0.50 * min(avg_err, 1.0)
+    elif race and cls:
+        be = BUCKET_ERRORS_LIVE.get((race, cls))
+        if be:
+            stat_keys = ("atk_err_pct_median", "def_err_pct_median",
+                         "spy_off_err_pct_median", "spy_def_err_pct_median")
+            errs = [be[k] for k in stat_keys if k in be]
+            if errs:
+                avg_err = sum(errs) / len(errs)
+                score -= 0.30 * min(avg_err, 1.0)
+
+    return max(0.0, min(1.0, score))
 
 
 def load_spy_cooldowns() -> dict:
@@ -3406,16 +4256,35 @@ def load_spy_cooldowns() -> dict:
 
 def load_intel_overlay() -> dict:
     """Read private_intel.csv and return {Player name: latest_stats}.
-    Latest row per player wins (by timestamp order in the file — append-only)."""
+    Latest row per player wins (by timestamp order in the file — append-only).
+
+    Rows older than INTEL_MAX_AGE_HOURS are skipped so stale data from
+    previous sessions doesn't override the rank model with numbers that
+    no longer reflect the player's current state.
+    """
     path = INTEL_FILE
     if not os.path.isfile(path):
         return {}
     overlay = {}
+    now    = datetime.datetime.now()
+    cutoff = now - datetime.timedelta(hours=INTEL_MAX_AGE_HOURS)
+    dropped_stale = 0
     try:
         with open(path, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 name = (row.get("Player") or "").strip()
                 if not name:
+                    continue
+                ts_str = (row.get("Timestamp") or "").strip()
+                row_dt = None
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                    try:
+                        row_dt = datetime.datetime.strptime(ts_str, fmt)
+                        break
+                    except ValueError:
+                        pass
+                if row_dt is not None and row_dt < cutoff:
+                    dropped_stale += 1
                     continue
                 overlay[name] = {
                     "level":    num(row.get("Level",    0)),
@@ -3428,11 +4297,70 @@ def load_intel_overlay() -> dict:
                     "gold":     num(row.get("Gold",   0)),
                     "bank":     num(row.get("Bank",   0)),
                     "citizens": num(row.get("Citizens", 0)),
+                    # Fort state — previously dropped by this loader even
+                    # though the CSV columns exist.  Phase 1 restores them
+                    # so estimate() can reason about repair state.
+                    "fort_hp":  num(row.get("FortHP",  0)),
+                    "fort_max": num(row.get("FortMax", 0)),
+                    # Army composition — flat unit counts from the CSV.
+                    # load_target_intel_snapshot() returns the same data as
+                    # a nested 'army' dict below; we keep both shapes so
+                    # old consumers that read flat fields still work AND
+                    # new consumers can use the nested form.
+                    "workers":  num(row.get("Workers",  0)),
+                    "soldiers": num(row.get("Soldiers", 0)),
+                    "guards":   num(row.get("Guards",   0)),
+                    "spies":    num(row.get("Spies",    0)),
+                    "sentries": num(row.get("Sentries", 0)),
                     "source":   row.get("Source", "").strip(),
-                    "timestamp":row.get("Timestamp", "").strip(),
+                    "timestamp":ts_str,
                 }
     except Exception as e:
         print(f"  ⚠️  load_intel_overlay failed: {e}")
+    if dropped_stale:
+        print(f"  🕒 load_intel_overlay: dropped {dropped_stale} stale row(s) (>{INTEL_MAX_AGE_HOURS}h)")
+
+    # ── Merge in rich snapshot data (Phase 1) ─────────────────────────────
+    # private_target_intel.json carries nested fields (army/armory/
+    # buildings/upgrades) that don't fit the flat CSV schema.  Scalars in
+    # the rich snapshot act as a fallback when the CSV row is missing or
+    # older — rich snapshot retention is 14 days vs CSV's 7.
+    try:
+        rich = load_target_intel_snapshot()
+        dropped_rich = 0
+        for name, rec in (rich or {}).items():
+            if not isinstance(rec, dict):
+                continue
+            ts_str = rec.get("captured_at", "")
+            row_dt = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    row_dt = datetime.datetime.strptime(ts_str, fmt)
+                    break
+                except ValueError:
+                    pass
+            if row_dt is not None and row_dt < cutoff:
+                dropped_rich += 1
+                continue   # honor the same freshness cutoff as CSV rows
+
+            row = overlay.get(name, {"source": rec.get("source", "spy"),
+                                      "timestamp": ts_str})
+            # Fill scalars from rich snapshot if CSV didn't supply them.
+            for key in ("level", "race", "cls", "atk", "def",
+                        "spy_off", "spy_def", "gold", "bank", "citizens",
+                        "fort_hp", "fort_max"):
+                if not row.get(key) and rec.get(key) not in (None, ""):
+                    row[key] = rec[key]
+            # Nested fields always copy over (rich snapshot is their only home).
+            for nest in ("army", "armory", "buildings", "upgrades"):
+                if nest in rec:
+                    row[nest] = rec[nest]
+            overlay[name] = row
+        if dropped_rich:
+            print(f"  🕒 load_intel_overlay: dropped {dropped_rich} stale rich-intel entr(ies)")
+    except Exception as e:
+        print(f"  ⚠️  load_intel_overlay rich-merge failed: {e}")
+
     return overlay
 
 
@@ -3688,6 +4616,8 @@ def battle_loop(stop_event, cfg: dict, log_fn, deadline_ts=None) -> dict:
     _base_stats = dict(cfg.get("our_stats") or {})
     for _k in ("atk", "def", "spy_off", "spy_def"):
         _base_stats.setdefault(_k, int(_seed_stats.get(_k, 0)))
+    # Level is needed for XP-farm-mode scoring in pick_battle_targets.
+    _base_stats.setdefault("level", int(_seed_stats.get("level", 1) or 1))
 
     log_fn(f"⚔  Battle loop starting — mode={mode} margin={cfg.get('margin',1.2)} "
            f"turns/hit={turns_per_hit} dry={dry_run}", "battle")
@@ -3752,6 +4682,29 @@ def battle_loop(stop_event, cfg: dict, log_fn, deadline_ts=None) -> dict:
                     )
                     if not targets:
                         log_fn("  ℹ️  No safe targets left this pass.", "dim")
+                        # Show the filter breakdown so the user knows WHICH
+                        # setting killed the pool, instead of guessing.
+                        reasons = getattr(targets, "reasons", None) or {}
+                        pool_size = getattr(targets, "pool_size", len(rows))
+                        nonzero = [(k, v) for k, v in reasons.items() if v > 0]
+                        if nonzero:
+                            nonzero.sort(key=lambda kv: -kv[1])
+                            pretty = "  ".join(f"{k}={v}" for k, v in nonzero)
+                            log_fn(f"  📋 filter breakdown (pool={pool_size}): {pretty}", "dim")
+                            # Suggest the most likely culprit to loosen.
+                            top_reason = nonzero[0][0]
+                            suggestions = {
+                                "under_min_gold": "lower Min gold (e.g. 50,000 or 0)",
+                                "margin_fail":    "lower Margin (e.g. 1.2)",
+                                "daily_cap_5_5":  "wait for daily reset or try different mode",
+                                "out_of_range":   "your level range has few targets right now",
+                                "no_def_est":     "run the estimator to get DEF estimates",
+                                "spy_cooldown":   f"wait ≤{SPY_COOLDOWN_HOURS}h for spy cooldown",
+                                "spy_margin_fail":"lower Margin or wait for more spies",
+                            }
+                            tip = suggestions.get(top_reason)
+                            if tip:
+                                log_fn(f"  💡 tip: {tip}", "dim")
                         raise BattleStop("no_targets", "filter + daily caps exhausted pool")
 
                     log_fn(f"  🎯 Pass: {len(targets)} candidate(s)", "dim")
@@ -4278,6 +5231,139 @@ def scrape_battle_logs(page, ts):
         print(f"     ✅ {len(new_rows)} new battle log entries")
     except Exception as e:
         print(f"     ⚠️ Battle logs failed: {e}")
+
+
+# ── Spy-log history harvester (Phase 1) ──────────────────────────────────
+# Visits /game/spy/logs and parses every spy report we haven't seen yet.
+# Captures MANUAL spies (user ran them through the browser) identically to
+# bot-initiated spies — the logs list contains both.  Dedup state is kept
+# in a JSON file so we don't re-parse the same report every tick; that would
+# waste bandwidth and double-count intel observations for growth tracking.
+SEEN_SPY_LOGS_FILE = "private_seen_spy_logs.json"
+# Cap per tick to avoid flooding: if the user just spied 50 people all at
+# once, we catch up over a few ticks rather than hammering the server in
+# one burst.  Each fetch is ~1 page load (1-2s), so 20 adds ~40s to a tick.
+SPY_LOGS_MAX_PER_TICK = 20
+
+
+def _load_seen_spy_logs() -> set:
+    """Load the set of already-parsed spy log IDs.  Returns empty set if
+    the file is missing or malformed — never raises."""
+    if not os.path.isfile(SEEN_SPY_LOGS_FILE):
+        return set()
+    try:
+        with open(SEEN_SPY_LOGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ids = data.get("seen_ids", []) if isinstance(data, dict) else []
+        return set(str(x) for x in ids)
+    except Exception:
+        return set()
+
+
+def _save_seen_spy_logs(seen: set, max_keep: int = 5000) -> None:
+    """Persist the seen-ID set.  Caps at max_keep entries (keep most recent
+    numeric IDs) to prevent unbounded file growth over weeks of play."""
+    try:
+        ids_sorted = sorted(
+            (s for s in seen if str(s).isdigit()),
+            key=lambda s: int(s),
+            reverse=True,
+        )[:max_keep]
+        # Preserve any non-numeric IDs as-is (shouldn't happen, but be safe)
+        extras = [s for s in seen if not str(s).isdigit()]
+        payload = {"seen_ids": sorted(ids_sorted + extras),
+                   "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        _unhide(SEEN_SPY_LOGS_FILE)
+        tmp = SEEN_SPY_LOGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, SEEN_SPY_LOGS_FILE)
+    except Exception:
+        pass
+
+
+def scrape_spy_logs(page, ts, log_fn=None) -> dict:
+    """Visit /game/spy/logs and harvest any unseen spy reports.  Parses each
+    new log via parse_spy_report() and funnels through record_intel() so
+    MANUAL spies (run in the user's browser) land in the same pipeline as
+    bot-initiated ones — same CSV, same rich JSON snapshot, same growth
+    tracking.
+
+    Returns a dict with counters: {'seen_before': N, 'new': N, 'failed': N}.
+    """
+    def _log(msg, tone="info"):
+        if log_fn: log_fn(msg, tone)
+        else:      print(msg)
+
+    _log("  🕵️  Harvesting spy-logs history...")
+    stats = {"seen_before": 0, "new": 0, "failed": 0, "skipped_nonspyok": 0}
+
+    seen_ids = _load_seen_spy_logs()
+
+    # Load the history page and extract all spy-log IDs.  The list renders
+    # each report as an anchor <a href="/game/spy/log/{id}">...</a>.  The
+    # JS below is tolerant of markup drift — we match on href pattern, not
+    # on specific wrapper classes, so a minor template change doesn't break
+    # harvesting silently.
+    try:
+        page.goto(f"{BASE_URL}/spy/logs")
+        page.wait_for_load_state("networkidle", timeout=15000)
+        id_list = page.evaluate(r"""() => {
+            const ids = new Set();
+            document.querySelectorAll('a[href*="/spy/log/"]').forEach(a => {
+                const m = (a.getAttribute('href') || '').match(/\/spy\/log\/(\d+)/);
+                if (m) ids.add(m[1]);
+            });
+            return Array.from(ids);
+        }""")
+    except Exception as e:
+        _log(f"     ⚠️  spy-logs list fetch failed: {e}", "warn")
+        return stats
+
+    # Newest first — most game-history lists render reverse-chronologically.
+    # When the cap kicks in we want the most recent intel, not the oldest.
+    id_list = sorted((str(x) for x in id_list or []),
+                     key=lambda s: int(s) if s.isdigit() else 0,
+                     reverse=True)
+
+    new_ids = [x for x in id_list if x not in seen_ids]
+    stats["seen_before"] = len(id_list) - len(new_ids)
+
+    if not new_ids:
+        _log(f"     ✅ {stats['seen_before']} log(s) already parsed — nothing new.")
+        return stats
+
+    to_fetch = new_ids[:SPY_LOGS_MAX_PER_TICK]
+    if len(new_ids) > SPY_LOGS_MAX_PER_TICK:
+        _log(f"     ℹ️  {len(new_ids)} new logs found — fetching top {SPY_LOGS_MAX_PER_TICK} this tick.")
+
+    for log_id in to_fetch:
+        try:
+            page.goto(f"{BASE_URL}/spy/log/{log_id}")
+            page.wait_for_load_state("networkidle", timeout=10000)
+            entry = parse_spy_report(page)
+            if entry.get("result") != "spy_ok":
+                stats["skipped_nonspyok"] += 1
+                # Still mark as seen so we don't keep re-fetching failed
+                # spies every tick (they never transition to success).
+                seen_ids.add(log_id)
+                continue
+            entry["source"] = "spy_log_history"   # distinguish in CSV audit
+            record_intel(entry, log_fn=log_fn)
+            seen_ids.add(log_id)
+            stats["new"] += 1
+        except Exception as e:
+            stats["failed"] += 1
+            _log(f"     ⚠️  log {log_id} parse failed: {e}", "warn")
+
+    _save_seen_spy_logs(seen_ids)
+
+    msg = (f"     ✅ harvested {stats['new']} new spy report(s) "
+           f"({stats['skipped_nonspyok']} non-successful skipped, "
+           f"{stats['seen_before']} already known, "
+           f"{stats['failed']} failed)")
+    _log(msg)
+    return stats
 
 
 def scrape_fort_attacks(page, ts):
@@ -5043,6 +6129,343 @@ def stat_per_unit(player_lv):
     ut = max_unit_tier(player_lv)
     return UNIT_OFF[ut] + WEAPON_STATS[gt] + ARMOR_STATS[gt]
 
+
+# ── Derived growth rate ─────────────────────────────────────────────────────
+# "Upper-bound growth if the player spends every coin on maxing out their
+# highest-tier gear + units at their current unlock ceiling."
+#
+# Used as a FALLBACK projection when we don't yet have enough observed
+# data points to compute a real slope (compute_growth_rates needs ≥2
+# observations spaced ≥30 min apart). Observed rate always wins when
+# > 0; derived is the educated guess we fall back on.
+#
+# Inputs all come from existing helpers — no new data sources needed:
+#   - est_mine_lv(), mine_mult(), BASE_INC, WORKER_GOLD → income
+#   - max_gear_tier(), max_unit_tier(), max_spy_tier() → tier unlocks
+#   - UNIT_OFF/DEF/SPY/SENT + WEAPON_STATS/ARMOR_STATS/SPY_* → stat-per-unit
+#   - GEAR[...][tier] → gear cost
+#   - UNIT_COST → train cost
+#   - RACE / CLASS → bonuses
+# ── Phase 2: Empirically-fitted allocation fractions ────────────────────────
+# derive_growth_rate() computes a per-tick stat growth assuming the player
+# allocates some fraction of their gold income to a specific stat type.
+# Historically that fraction was hardcoded at 0.5 ("half goes to this stat").
+# With rich intel history we can do better: observe how players with a given
+# (race, class) actually split their budget, and fit the fraction per bucket.
+#
+#   Carrot / Mettalica (Elf/Goblin Clerics): high def fraction, low atk
+#   Jasbob / Fighters:                       high atk fraction, low def
+#   Thieves:                                 more income → buildings, less on gear
+#
+# Learning per-(race, class, stat) fractions bakes those real strategies into
+# the model — so a newly-spotted Elf Cleric inherits Carrot-like growth
+# assumptions even before we have ANY intel on her specifically.
+#
+# Populated once per tick by calibrate_models().  Empty at startup → every
+# derive_growth_rate() call falls back to DEFAULT_ALLOCATION_FRACTION.
+DEFAULT_ALLOCATION_FRACTION = 0.5
+ALLOCATION_MIN_SAMPLES      = 3     # buckets with fewer players stay at default
+ALLOCATION_MAX_FRACTION     = 1.0   # no player can spend >100% of income on one stat
+FITTED_ALLOCATIONS: dict    = {}    # {(race, cls, stat): median_fraction}
+
+
+def _theoretical_stat_rate(level: int, race: str, cls: str,
+                           pop: int, stat_type: str) -> float:
+    """derive_growth_rate() with allocation = 1.0 — the theoretical per-tick
+    growth if a player dumped 100% of income into this one stat.  Used as
+    the denominator when fitting observed allocation fractions.
+
+    Returns 0.0 when inputs are invalid so callers can skip those samples."""
+    if level <= 0 or pop <= 0:
+        return 0.0
+
+    mine_lv  = est_mine_lv(level)
+    workers  = max(int(pop * 0.80), 1)
+    rb       = RACE.get(race, RACE['Human'])
+    cb       = CLASS.get(cls,  CLASS['Fighter'])
+    income   = ((BASE_INC + workers * WORKER_GOLD)
+                * mine_mult(mine_lv)
+                * (1 + rb.get('income', 0) + cb.get('income', 0)))
+    if income <= 0:
+        return 0.0
+
+    gt = max_gear_tier(level)
+    ut = max_unit_tier(level)
+    st = max_spy_tier(level)
+
+    if stat_type == 'atk':
+        stat_pu   = UNIT_OFF[ut] + WEAPON_STATS[gt] + ARMOR_STATS[gt]
+        unit_cost = UNIT_COST.get('soldier', 1000)
+        gear_cost = (GEAR[('soldier', 'weapon')][gt][2]
+                     + GEAR[('soldier', 'armor')][gt][2])
+        bonus     = rb.get('atk', 0) + cb.get('atk', 0)
+    elif stat_type == 'def':
+        stat_pu   = UNIT_DEF[ut] + WEAPON_STATS[gt] + ARMOR_STATS[gt]
+        unit_cost = UNIT_COST.get('guard', 1000)
+        gear_cost = (GEAR[('guard', 'weapon')][gt][2]
+                     + GEAR[('guard', 'armor')][gt][2])
+        bonus     = rb.get('def', 0) + cb.get('def', 0)
+    elif stat_type == 'spy_off':
+        spy_ut    = min(ut, max(UNIT_SPY))
+        stat_pu   = UNIT_SPY[spy_ut] + SPY_WEAPON[st] + SPY_ARMOR[st]
+        unit_cost = UNIT_COST.get('spy', 1000)
+        gear_cost = (GEAR[('spy', 'weapon')][st][2]
+                     + GEAR[('spy', 'armor')][st][2])
+        bonus     = rb.get('spy', 0) + cb.get('spy', 0)
+    elif stat_type == 'spy_def':
+        sent_ut   = min(ut, max(UNIT_SENT))
+        stat_pu   = UNIT_SENT[sent_ut] + SPY_WEAPON[st] + SPY_ARMOR[st]
+        unit_cost = UNIT_COST.get('sentry', 1000)
+        gear_cost = (GEAR[('sentry', 'weapon')][st][2]
+                     + GEAR[('sentry', 'armor')][st][2])
+        bonus     = rb.get('spy', 0) + cb.get('spy', 0)
+    else:
+        return 0.0
+
+    total_cost = unit_cost + gear_cost
+    if total_cost <= 0:
+        return 0.0
+
+    # allocation = 1.0 (100% of income → this stat)
+    units_per_tick = income / total_cost
+    return max(0.0, units_per_tick * stat_pu * (1 + bonus))
+
+
+def compute_allocation_observations(growth_rates: dict,
+                                    demographics: dict) -> dict:
+    """For each player in growth_rates with known (level, race, class, pop),
+    compute the ratio observed_per_tick / theoretical_per_tick for each of
+    the 4 combat stats, and bucket by (race, class, stat).
+
+    Args:
+        growth_rates: output of compute_growth_rates() — {name: {atk_per_tick, ...}}
+        demographics: {name: (level, race, cls, pop)} — pass None for
+                      unknown players; those are skipped.
+
+    Returns {(race, cls, stat): [ratio, ratio, ...]}.  Empty when nothing
+    observable (too few players, or no demographic data).
+    """
+    buckets: dict = {}
+    for name, rates in (growth_rates or {}).items():
+        demo = demographics.get(name) if demographics else None
+        if not demo:
+            continue
+        level, race, cls, pop = demo
+        if level <= 0 or pop <= 0 or not race or not cls:
+            continue
+        for stat_key, rate_key in (
+            ('atk',     'atk_per_tick'),
+            ('def',     'def_per_tick'),
+            ('spy_off', 'spy_off_per_tick'),
+            ('spy_def', 'spy_def_per_tick'),
+        ):
+            observed = float(rates.get(rate_key, 0) or 0)
+            if observed <= 0:
+                continue   # no positive growth observed this window
+            theoretical = _theoretical_stat_rate(level, race, cls, pop, stat_key)
+            if theoretical <= 0:
+                continue
+            ratio = observed / theoretical
+            # Clamp unreasonable ratios — noise (bad intel, level jumps that
+            # the theoretical rate can't model) would otherwise skew the fit.
+            # A ratio > 1 means the player grew faster than the theoretical
+            # 100%-allocation bound, which can only happen transiently (e.g.
+            # big gear upgrade from banked gold); we don't want that one
+            # observation to drag the bucket median to nonsense.
+            if ratio > ALLOCATION_MAX_FRACTION * 1.5:
+                continue
+            ratio = max(0.0, min(ratio, ALLOCATION_MAX_FRACTION))
+            buckets.setdefault((race, cls, stat_key), []).append(ratio)
+    return buckets
+
+
+def fit_allocation_fractions(buckets: dict,
+                             min_samples: int = ALLOCATION_MIN_SAMPLES) -> dict:
+    """Aggregate per-bucket ratios into a single fraction.  Uses median
+    (not mean) so a single outlier player doesn't skew the fit.  Buckets
+    with fewer than min_samples observations are dropped — the caller will
+    fall back to DEFAULT_ALLOCATION_FRACTION."""
+    out: dict = {}
+    for key, ratios in (buckets or {}).items():
+        if not ratios or len(ratios) < min_samples:
+            continue
+        s = sorted(ratios)
+        n = len(s)
+        # Manual median (stdlib statistics module not needed for 4-8 items)
+        mid = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+        out[key] = float(mid)
+    return out
+
+
+def derive_growth_rate(level: int, race: str, cls: str,
+                       pop: int, stat_type: str) -> float:
+    """Per-tick stat growth assuming income → units+gear at the player's
+    max unlocked tier, with an EMPIRICALLY-FITTED allocation fraction when
+    we have enough observations for this (race, class, stat) bucket.
+    Falls back to DEFAULT_ALLOCATION_FRACTION otherwise.
+
+    stat_type: one of 'atk', 'def', 'spy_off', 'spy_def'.
+    Returns float stat-points per 30-minute tick; 0.0 if inputs invalid.
+    """
+    if level <= 0 or pop <= 0:
+        return 0.0
+    base = _theoretical_stat_rate(level, race, cls, pop, stat_type)
+    if base <= 0:
+        return 0.0
+    frac = FITTED_ALLOCATIONS.get((race, cls, stat_type),
+                                  DEFAULT_ALLOCATION_FRACTION)
+    return max(0.0, base * frac)
+
+
+# ── Phase 3: Precision from rich intel ──────────────────────────────────────
+# When we have a fresh spy report for a target we don't need to GUESS their
+# mine level or reconstruct ATK from a rank curve — we know what buildings
+# they own, what gear is in their armory, and what battle upgrades they've
+# bought.  These helpers turn that intel into exact values estimate() can
+# publish instead of approximations.
+#
+# Freshness window matches CALIBRATION_FRESH_HOURS (48h).  Beyond that the
+# intel is a floor, not a current-truth — the player has almost certainly
+# grown past what we last saw.
+RICH_INTEL_FRESH_HOURS = CALIBRATION_FRESH_HOURS
+
+
+def _is_rich_intel_fresh(rich_intel: dict) -> bool:
+    """True if the snapshot was captured within RICH_INTEL_FRESH_HOURS.
+    Stale snapshots still provide useful FLOORS (via CONFIRMED_STATS path)
+    but their exact-state numbers (mine level, army comp, etc.) have
+    already drifted — we don't trust them as current-truth."""
+    if not rich_intel or not isinstance(rich_intel, dict):
+        return False
+    ts = rich_intel.get("captured_at", "")
+    if not ts:
+        return False
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            dt = datetime.datetime.strptime(ts, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        return False
+    age = datetime.datetime.now() - dt
+    return age.total_seconds() < RICH_INTEL_FRESH_HOURS * 3600
+
+
+def _exact_income_from_intel(rich_intel: dict, race: str, cls: str):
+    """Compute exact gold/tick from known mine level + worker count.
+
+    Returns int income or None when the needed fields aren't in the snapshot.
+    """
+    if not rich_intel or not isinstance(rich_intel, dict):
+        return None
+    army      = rich_intel.get("army", {}) or {}
+    buildings = rich_intel.get("buildings", {}) or {}
+    workers   = int(army.get("workers", 0) or 0)
+    mine_lv   = buildings.get("mine")
+    if mine_lv is None or workers <= 0:
+        return None
+    rb = RACE.get(race, RACE['Human'])
+    cb = CLASS.get(cls,  CLASS['Fighter'])
+    return int((BASE_INC + workers * WORKER_GOLD)
+               * mine_mult(int(mine_lv))
+               * (1 + rb.get('income', 0) + cb.get('income', 0)))
+
+
+def _reconstruct_stat_from_intel(rich_intel: dict, race: str, cls: str,
+                                  kind: str):
+    """Rebuild exact ATK or DEF from the target's army + armory + battle
+    upgrades as captured in the spy report.
+
+    Formula (matches in-game displayed total):
+        base = soldiers × per_unit_bonus
+             + min(weapon_qty, soldiers) × weapon_bonus
+             + min(armor_qty,  soldiers) × armor_bonus
+             + battle_upgrade_qty × upgrade_bonus
+        total = base × (1 + race_bonus + class_bonus)
+
+    kind: 'atk' (offensive military + Offense gear + Offense upgrades)
+       or 'def' (defensive military + Defense gear + Defense upgrades).
+
+    Returns int or None if required fields missing.
+    """
+    if not rich_intel or not isinstance(rich_intel, dict):
+        return None
+    if kind not in ('atk', 'def'):
+        return None
+
+    army_detail = rich_intel.get("army_detail", {}) or {}
+    armory      = rich_intel.get("armory", {})      or {}
+    upgrades    = rich_intel.get("upgrades", {})    or {}
+
+    role_key      = 'soldiers'         if kind == 'atk' else 'guards'
+    gear_weapon   = 'Offense Weapons'  if kind == 'atk' else 'Defense Weapons'
+    gear_armor    = 'Offense Armor'    if kind == 'atk' else 'Defense Armor'
+    upgrade_kind  = 'Offense'          if kind == 'atk' else 'Defense'
+    bonus_stat    = 'atk'              if kind == 'atk' else 'def'
+
+    role = army_detail.get(role_key) or {}
+    qty  = int(role.get('qty', 0)   or 0)
+    unit_bonus = int(role.get('bonus', 0) or 0)
+    if qty <= 0:
+        return None
+
+    # Unit contribution
+    base = qty * unit_bonus
+
+    # Weapons (1:1 with units — game enforces this cap)
+    weapon_stat = 0
+    for _item, detail in armory.items():
+        if (detail or {}).get('category') == gear_weapon:
+            wqty   = int(detail.get('qty', 0)   or 0)
+            wbonus = int(detail.get('bonus', 0) or 0)
+            equipped = min(wqty, qty)
+            weapon_stat += equipped * wbonus
+    base += weapon_stat
+
+    # Armor (1:1 with units)
+    armor_stat = 0
+    for _item, detail in armory.items():
+        if (detail or {}).get('category') == gear_armor:
+            aqty   = int(detail.get('qty', 0)   or 0)
+            abonus = int(detail.get('bonus', 0) or 0)
+            equipped = min(aqty, qty)
+            armor_stat += equipped * abonus
+    base += armor_stat
+
+    # Battle upgrades (Steed for Offense, Guard Tower for Defense)
+    upgrade_stat = 0
+    for _upg, detail in upgrades.items():
+        if (detail or {}).get('kind') == upgrade_kind:
+            uqty   = int(detail.get('qty', 0)   or 0)
+            ubonus = int(detail.get('bonus', 0) or 0)
+            upgrade_stat += uqty * ubonus
+    base += upgrade_stat
+
+    # Race/class multiplier
+    rb = RACE.get(race, RACE['Human'])
+    cb = CLASS.get(cls,  CLASS['Fighter'])
+    mult = 1 + rb.get(bonus_stat, 0) + cb.get(bonus_stat, 0)
+    return int(base * mult)
+
+
+def _fort_damage_pct(rich_intel: dict):
+    """Fort damage as a fraction [0, 1].  0 = full HP, 1 = destroyed.
+    Returns None when fort fields aren't available."""
+    if not rich_intel or not isinstance(rich_intel, dict):
+        return None
+    hp  = rich_intel.get("fort_hp")
+    mx  = rich_intel.get("fort_max")
+    if hp is None or not mx:
+        return None
+    try:
+        hp_f = float(hp); mx_f = float(mx)
+        if mx_f <= 0:
+            return None
+        return max(0.0, 1.0 - hp_f / mx_f)
+    except (TypeError, ValueError):
+        return None
+
 # ── Race/class bonuses (CONFIRMED from in-game UI screenshot 2026-04-08) ──────
 # Source: game Race/Class selection screen, showing exact bonuses per choice.
 #
@@ -5124,28 +6547,122 @@ def _fit_exponential(rank1, val1, rank2, val2):
     return (A, k) if A > 0 and k > 0 else (0.0, 0.0)
 
 
+def _fit_exp_regression(points):
+    """Fit stat = A * exp(-k * rank) via log-linear least-squares over
+    ALL supplied (rank, value) points. Gives extra weight to the lowest
+    rank (top of the curve) because rank 1-10 are what we most need
+    accurate — the tail of the distribution doesn't matter for battle
+    decisions. Returns (A, k) or (0, 0) if the fit fails.
+
+    Weighting scheme: each point gets weight = 1 / log(rank + 1).
+    rank 1 → weight ~1.44, rank 30 → weight ~0.29, rank 80 → weight ~0.23.
+    This keeps the low ranks authoritative without letting a single
+    noisy top-end point dominate.
+    """
+    pts = [(r, v) for (r, v) in points if r > 0 and r < 900 and v > 0]
+    if len(pts) < 2:
+        return 0.0, 0.0
+    # Transform to log space: log(v) = log(A) - k * r
+    import math as _m
+    xs, ys, ws = [], [], []
+    for r, v in pts:
+        xs.append(float(r))
+        ys.append(_m.log(float(v)))
+        ws.append(1.0 / _m.log(float(r) + 1.0))
+    W  = sum(ws)
+    if W <= 0:
+        return 0.0, 0.0
+    mx = sum(w * x for w, x in zip(ws, xs)) / W
+    my = sum(w * y for w, y in zip(ws, ys)) / W
+    num = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys))
+    den = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
+    if den <= 0:
+        return 0.0, 0.0
+    slope     = num / den          # slope of log(v) vs r   =   -k
+    intercept = my - slope * mx    # log(A)
+    k = -slope
+    A = _m.exp(intercept)
+    if A <= 0 or k <= 0:
+        return 0.0, 0.0
+    return A, k
+
+
 def _seed_model(points: list, base_k: float, label: str, your_point=None):
     """Fit or seed a model from a list of (rank, value) confirmed points.
     Returns (A, k).
 
-    Strategy:
-      1. Filter out rank >= 900 sentinels (= "rank unknown") and non-positive values.
-      2. If 2+ points, find ALL valid pairs (A>0, k>0) and pick the BEST one:
-         - First preference: pairs that include YOUR own (rank, stat) anchor,
-           because that anchor is guaranteed to be fresh and exact this tick.
-         - Second preference: widest rank-span (largest r2-r1).  Wide spans
-           give a much more reliable slope estimate than adjacent-rank pairs,
-           which amplify local noise and overshoot k.
-      3. If no valid pair exists, fall back to a 1-point seed using the
-         highest-VALUE point.  Since confirmed stats are FLOORS, the highest
-         floor is the most current/binding anchor we have.
-      4. If only one point exists, seed directly from it.
+    Priority of fit strategies:
+      1. YOU + highest-value point (2-point exact fit). YOU is the
+         freshest ground truth for your rank; the highest-value point
+         (e.g. Radagon 530k at rank 1) is the best-known top-of-curve
+         floor. The resulting curve passes exactly through BOTH, which
+         is what battle decisions need.
+      2. Log-linear weighted regression over all points, re-anchored
+         vertically so the curve passes through the highest-value
+         point. Used when YOU isn't available (spy ranks not scraped).
+      3. 2-point fallback (widest-span pair picker).
+      4. 1-point fallback (seed from the single known point).
     """
     points = sorted(p for p in points if p[0] > 0 and 0 < p[0] < 900 and p[1] > 0)
+    if not points:
+        return 0.0, 0.0
 
     def _is_your(p):
         return your_point is not None and p == your_point
 
+    # Strategy 1: regression re-anchored at TOP confirmed value (≥4 pts)
+    # With 4+ calibration points the regression uses ALL the data —
+    # rank-1 to rank-50 — to find the best-fit slope instead of the
+    # naive 2-point line that misses the middle of the curve.
+    #
+    # We re-anchor at the HIGHEST-VALUE confirmed point (usually rank 1)
+    # so the top of the curve is exact. This prevents the model from
+    # producing rank-2 estimates higher than rank-1 (which is logically
+    # impossible and causes display rank-order violations on the
+    # dashboard). YOUR rank always shows your real stat via the is_you
+    # branch in estimate() regardless of the model's prediction there.
+    if len(points) >= 4:
+        A, k = _fit_exp_regression(points)
+        if A > 0 and k > 0:
+            k_c = min(k, 0.12)   # slightly higher cap than 2-pt to let the slope breathe
+            top = max(points, key=lambda p: p[1])
+            A = top[1] / math.exp(-k_c * top[0])
+            your_est = int(A * math.exp(-k_c * your_point[0])) if your_point else 0
+            preview = ", ".join(f"r{p[0]}={p[1]:,}" for p in points[:4])
+            anchor_lbl = f"top r{top[0]}={top[1]:,}"
+            you_lbl    = f"  YOUR r{your_point[0]}→{your_est:,}" if your_point else ""
+            print(f"     📐 {label} regression ({len(points)} pts, "
+                  f"anchored {anchor_lbl}): "
+                  f"A={A:,.0f} k={k_c:.4f}{you_lbl}  [{preview} ...]")
+            return A, k_c
+
+    # Strategy 2: YOU + highest-value anchor (fallback with <4 pts)
+    if your_point and your_point[0] > 0 and your_point[0] < 900 and your_point[1] > 0:
+        others = [p for p in points if not _is_your(p)]
+        if others:
+            top = max(others, key=lambda p: p[1])
+            A, k = _fit_exponential(top[0], top[1], your_point[0], your_point[1])
+            if A > 0 and k > 0:
+                k_c = min(k, 0.10)
+                if k_c < k:
+                    A = top[1] / math.exp(-k_c * top[0])
+                print(f"     📐 {label} calibrated (YOU+top): "
+                      f"A={A:,.0f} k={k_c:.4f}  "
+                      f"(YOU {your_point[0]}={your_point[1]:,}, "
+                      f"top rank {top[0]}={top[1]:,}, {len(points)} pts)")
+                return A, k_c
+
+    # Strategy 3: regression with re-anchor at top of curve (no YOUR point)
+    if len(points) >= 3:
+        A, k = _fit_exp_regression(points)
+        if A > 0 and k > 0:
+            top = max(points, key=lambda p: p[1])
+            A = top[1] / math.exp(-k * top[0])
+            print(f"     📐 {label} regression ({len(points)} pts) re-anchored: "
+                  f"A={A:,.0f} k={k:.4f}  top: rank {top[0]}={top[1]:,}")
+            return A, k
+
+    # Strategy 3: widest-span 2-point fallback
     if len(points) >= 2:
         candidates = []   # (has_your, span, A, k, p1, p2)
         for i in range(len(points)):
@@ -5157,21 +6674,13 @@ def _seed_model(points: list, base_k: float, label: str, your_point=None):
                     has_your = _is_your(p1) or _is_your(p2)
                     candidates.append((has_your, span, A, k, p1, p2))
         if candidates:
-            # Sort by:
-            #   1. has_your (YOUR anchor always wins — it's ground truth)
-            #   2. widest span (wider = less sensitive to adjacent-rank noise)
-            #   3. SMALLEST k (flattest fit — when two points with the same
-            #      span produce different slopes, prefer the flatter one so
-            #      outliers like Thief-class players with near-zero DEF
-            #      don't over-extrapolate the top of the curve)
             candidates.sort(key=lambda c: (not c[0], -c[1], c[3]))
             has_your, span, A, k, p1, p2 = candidates[0]
             tag = " [YOUR]" if has_your else ""
-            print(f"     📐 {label} calibrated:  A={A:,.0f} k={k:.4f} "
+            print(f"     📐 {label} calibrated (2pt):  A={A:,.0f} k={k:.4f} "
                   f"(pts: {p1}, {p2}, span={span}){tag}")
             return A, k
-        # No valid pair — all points contradict each other (stale confirmed data).
-        # Prefer YOUR point for the 1-point seed; else use the highest-value floor.
+        # No valid pair — seed from best single point
         if your_point and your_point[0] > 0 and your_point[1] > 0 and your_point[0] < 900:
             r, v = your_point
             note = "YOUR live anchor"
@@ -5185,6 +6694,8 @@ def _seed_model(points: list, base_k: float, label: str, your_point=None):
         print(f"     📐 {label} seeded (fallback 1pt): A={A:,.0f} k={k:.4f} "
               f"(rank={r}, val={v:,})")
         return A, k
+
+    # Strategy 4: single point
     if len(points) == 1:
         r, v = points[0]
         k = base_k
@@ -5233,16 +6744,76 @@ def calibrate_models(profiles: dict, you: dict = None):
     global CONFIRMED_STATS_LIVE   # module-level merged dict, read by estimate()
     atk_pts, def_pts, spo_pts, spd_pts = [], [], [], []
 
+    # Rank snapshot — freshest + most complete rank source (every ranked
+    # player, scraped this tick).  Used below as a fallback when a confirmed
+    # anchor's rank isn't in the profile-scrape output + CS doesn't carry a
+    # rank hint.  Without this, anchors for top players like Jasbob/Mungus/
+    # Tycoon silently drop out of the fit and the curve defaults to its
+    # seed values — which is why rank_atk(5) used to return ~53k instead
+    # of ~400k on a server where rank 1 has 545k ATK.
+    _rank_snap_for_cal = {}
+    try:
+        if os.path.isfile('private_rankings_snapshot.json'):
+            with open('private_rankings_snapshot.json', encoding='utf-8') as f:
+                _rank_snap_for_cal = json.load(f).get('rank_map', {}) or {}
+    except Exception as _e:
+        pass
+
     # Merge hardcoded CONFIRMED_STATS with any intel harvested from real
     # attack / spy reports (private_intel.csv).  Intel wins on a per-stat
     # basis — if we spied someone's def=4,152 yesterday that beats whatever
     # floor was hardcoded, AND the per-stat max() floor treatment in
     # estimate() keeps the model conservative against growth.
-    confirmed_all = {k: dict(v) for k, v in CONFIRMED_STATS.items()}   # deep-ish copy
+    #
+    # Each merged stat also carries a per-stat "verified_at" timestamp so
+    # calibrate_models can age-filter: stale snapshots still act as a
+    # floor in estimate() but no longer drag the rank curve down as
+    # anchors. Hardcoded CONFIRMED_STATS entries may specify an optional
+    # 'verified_at' field in two forms:
+    #   'verified_at': '2026-04-15'              # applies to every stat
+    #   'verified_at': {'def': '2026-04-15'}     # per-stat (others stay stale)
+    # If missing, the entry is treated as unknown-age and excluded from
+    # calibration entirely.
+    def _parse_verified_at(v):
+        if not v: return None
+        if isinstance(v, datetime.datetime): return v
+        s = str(v).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _resolve_verified_at(entry: dict, stat: str):
+        """Look up the verified_at timestamp for a single stat on a
+        hardcoded CONFIRMED_STATS row. Returns a datetime or None."""
+        v = entry.get('verified_at')
+        if not v:
+            return None
+        if isinstance(v, dict):
+            return _parse_verified_at(v.get(stat))
+        return _parse_verified_at(v)
+
+    confirmed_all = {}
+    for k, v in CONFIRMED_STATS.items():
+        base = dict(v)
+        # Per-stat verified_at: a hardcoded entry can be partly fresh
+        # (e.g. def was re-confirmed today) and partly stale (e.g. atk
+        # from an old screenshot) — stamp each stat individually so
+        # calibrate only pulls the fresh ones into the fit.
+        for stat in ('atk', 'def', 'spy_off', 'spy_def'):
+            if base.get(stat):
+                dt = _resolve_verified_at(v, stat)
+                if dt is not None:
+                    base[f'{stat}_verified_at'] = dt
+        confirmed_all[k] = base
+
     try:
         overlay = load_intel_overlay()
         for iname, ient in overlay.items():
             base = dict(confirmed_all.get(iname, {}))
+            intel_dt = _parse_verified_at(ient.get('timestamp', ''))
             for k_intel, k_cs in [
                 ("atk",     "atk"),
                 ("def",     "def"),
@@ -5252,6 +6823,11 @@ def calibrate_models(profiles: dict, you: dict = None):
                 v = int(ient.get(k_intel, 0))
                 if v > 0 and v > int(base.get(k_cs, 0) or 0):
                     base[k_cs] = v
+                    # Stamp this stat with the intel timestamp so the
+                    # calibration step can tell fresh intel apart from
+                    # the hardcoded floors.
+                    if intel_dt is not None:
+                        base[f'{k_cs}_verified_at'] = intel_dt
             # Demographic fields — prefer intel (fresher) when present.
             for k in ("level", "race", "cls"):
                 if ient.get(k):
@@ -5271,19 +6847,254 @@ def calibrate_models(profiles: dict, you: dict = None):
     # live profile rank supersedes any hardcoded rank.
     # Publish the merged dict for estimate() to read this tick.
     CONFIRMED_STATS_LIVE = confirmed_all
+
+    cal_cutoff = (datetime.datetime.now()
+                  - datetime.timedelta(hours=CALIBRATION_FRESH_HOURS))
+
+    def _is_fresh(cs: dict, stat: str) -> bool:
+        """Per-stat freshness check for calibration anchors."""
+        dt = cs.get(f'{stat}_verified_at')
+        return isinstance(dt, datetime.datetime) and dt >= cal_cutoff
+
+    stale_dropped = {'atk': 0, 'def': 0, 'spy_off': 0, 'spy_def': 0}
+    bots_dropped = 0
+
+    # ── Growth projection for calibration anchors ──────────────────
+    # Rank-1 (and every rank) grows every tick. A confirmed stat
+    # captured yesterday is already stale — if we feed it to the fit
+    # as-is, the whole curve is anchored too low. Project each stat
+    # FORWARD to "now" using the player's observed growth rate before
+    # feeding it to the curve fit. This keeps the rank model aligned
+    # with current reality as everyone levels up.
+    global GROWTH_RATES_LIVE
+    _cal_now    = datetime.datetime.now()
+    _growth_map = {}
+    try:
+        _growth_map = compute_growth_rates(load_player_growth())
+    except Exception as e:
+        print(f"     ⚠️  calibrate: growth projection unavailable ({e})")
+    # Publish for estimate() to project confirmed stats forward too —
+    # otherwise the dashboard displays stale snapshots (e.g. TGO 394k
+    # ATK frozen at the April-15 confirmation) even as the player grows.
+    GROWTH_RATES_LIVE = _growth_map
+
+    # ── Phase 2: fit per-(race, class, stat) allocation fractions ─────
+    # Walk observed per-tick rates in _growth_map, pair each with the
+    # player's demographics (level/race/class/pop) so we can compute a
+    # theoretical 100%-allocation rate as the denominator.  The ratio
+    # observed:theoretical is the empirical fraction that player allocated
+    # to this stat.  Buckets with ≥ALLOCATION_MIN_SAMPLES players get a
+    # median-of-ratios fit; everything else falls back to the default.
+    # derive_growth_rate() (called immediately below when we build
+    # DERIVED_GROWTH_RATES_LIVE) reads FITTED_ALLOCATIONS so the fitted
+    # fractions take effect THIS tick, not next.
+    global FITTED_ALLOCATIONS
+    _alloc_demos: dict = {}
+    try:
+        _baseline_for_alloc = {p[0].replace(' (YOU)', ''): p for p in PLAYERS}
+        # Every name appearing in the growth map gets its best-known
+        # (level, race, cls, pop) triple.  Source priority: profile scrape
+        # (freshest) > CONFIRMED_STATS_LIVE (merged with intel overlay) >
+        # PLAYERS tuple (stale demographic fallback).
+        for _cname in (_growth_map or {}).keys():
+            _lvl = 0; _race = ''; _cls = ''; _pop = 0
+            base = _baseline_for_alloc.get(_cname)
+            if base:
+                _lvl, _race, _cls, _pop = base[1], base[2], base[3], base[4]
+            cs  = (confirmed_all or {}).get(_cname) or {}
+            if cs.get('level'):     _lvl  = cs['level']  or _lvl
+            if cs.get('race'):      _race = cs['race']   or _race
+            if cs.get('cls'):       _cls  = cs['cls']    or _cls
+            prof = (profiles or {}).get(_cname, {})
+            if prof.get('level'):       _lvl  = prof['level']       or _lvl
+            if prof.get('race'):        _race = prof['race']        or _race
+            if prof.get('cls'):         _cls  = prof['cls']         or _cls
+            if prof.get('population'):  _pop  = prof['population']  or _pop
+            # Skip bots — they don't follow the standard build progression
+            if '[bot]' in _cname.lower():
+                continue
+            _alloc_demos[_cname] = (_lvl, _race, _cls, _pop)
+        _buckets = compute_allocation_observations(_growth_map, _alloc_demos)
+        FITTED_ALLOCATIONS = fit_allocation_fractions(_buckets)
+        if FITTED_ALLOCATIONS:
+            # Brief summary in the tick log — full detail in the fitted dict.
+            _samples = sum(len(v) for v in _buckets.values())
+            print(f"     📈 allocation fit: {len(FITTED_ALLOCATIONS)} bucket(s) "
+                  f"over {_samples} observation(s) "
+                  f"(of {len(_buckets)} total bucket(s) before min-samples gate)")
+    except Exception as _e:
+        print(f"     ⚠️  allocation fit failed: {_e}")
+        FITTED_ALLOCATIONS = {}
+
+    # ── Phase 4: projection vs intel error feedback ──────────────────────
+    # Pair projections from private_projection_log.csv with the latest intel
+    # overlay to measure how accurate our estimates have been.  Populates
+    # PROJECTION_ERRORS_LIVE (per-player) + BUCKET_ERRORS_LIVE (per-bucket)
+    # which estimate() reads via _confidence_score() to stamp conf_score.
+    # First run with no history → no errors yet, conf_score falls back to
+    # the heuristic-only path.  As projections + intel accumulate, confidence
+    # scores become data-driven.
+    global PROJECTION_ERRORS_LIVE, BUCKET_ERRORS_LIVE
+    try:
+        _proj_log = load_projection_log()
+        # Reuse the overlay loaded above if available; otherwise re-read.
+        # `overlay` may be undefined if the earlier try/except failed before
+        # the assignment, hence the defensive locals() check.
+        _overlay_for_err = (overlay if 'overlay' in locals() and isinstance(overlay, dict)
+                            else load_intel_overlay())
+        _p_err, _b_err = compute_projection_errors(_proj_log, _overlay_for_err)
+        PROJECTION_ERRORS_LIVE = _p_err
+        BUCKET_ERRORS_LIVE     = _b_err
+        if _p_err:
+            # Brief summary — full detail available to estimate() via module state.
+            n_players = len(_p_err)
+            avg_err = sum(
+                (sum(p.get(k, 0) for k in
+                     ('atk_err_pct','def_err_pct','spy_off_err_pct','spy_def_err_pct')
+                     if k in p) / max(1, sum(1 for k in
+                     ('atk_err_pct','def_err_pct','spy_off_err_pct','spy_def_err_pct') if k in p)))
+                for p in _p_err.values()
+            ) / max(1, n_players)
+            print(f"     🎯 projection accuracy: {n_players} player(s) checked, "
+                  f"avg stat error {avg_err:.1%} — "
+                  f"{len(_b_err)} (race,class) bucket(s) with error history")
+    except Exception as _e:
+        print(f"     ⚠️  projection-error compute failed: {_e}")
+        PROJECTION_ERRORS_LIVE = {}
+        BUCKET_ERRORS_LIVE     = {}
+
+    # Populate DERIVED growth rates from level/race/class/population.
+    # This is a FALLBACK for players whose observed rate is 0 (not enough
+    # growth-CSV observations yet). Every known player gets a derived
+    # rate so no confirmed snapshot stays frozen.
+    global DERIVED_GROWTH_RATES_LIVE
+    _derived_map = {}
+    try:
+        # Walk the PLAYERS baseline first, then overlay any additional
+        # players found in the scraped profiles (which may include
+        # players not in the static PLAYERS list).
+        _seen_d = set()
+        _baseline = {p[0].replace(' (YOU)', ''): p for p in PLAYERS}
+        # Union of PLAYERS + profiles keys
+        _all_names = set(_baseline.keys()) | set((profiles or {}).keys())
+        for _clean_p in _all_names:
+            base = _baseline.get(_clean_p)
+            _plvl  = base[1] if base else 0
+            _prace = base[2] if base else ''
+            _pcls  = base[3] if base else ''
+            _ppop  = base[4] if base else 0
+            # Prefer scraped profile data when it's richer than the baseline
+            _prof = profiles.get(_clean_p, {}) if profiles else {}
+            _plvl  = _prof.get('level',      _plvl)  or _plvl
+            _prace = _prof.get('race',       _prace) or _prace
+            _pcls  = _prof.get('cls',        _pcls)  or _pcls
+            _ppop  = _prof.get('population', _ppop)  or _ppop
+            if _plvl <= 0 or _ppop <= 0:
+                continue
+            # Skip bots — they don't follow the derived model
+            if '[bot]' in _clean_p.lower():
+                continue
+            _derived_map[_clean_p] = {
+                'atk_per_tick':     derive_growth_rate(_plvl, _prace, _pcls, _ppop, 'atk'),
+                'def_per_tick':     derive_growth_rate(_plvl, _prace, _pcls, _ppop, 'def'),
+                'spy_off_per_tick': derive_growth_rate(_plvl, _prace, _pcls, _ppop, 'spy_off'),
+                'spy_def_per_tick': derive_growth_rate(_plvl, _prace, _pcls, _ppop, 'spy_def'),
+            }
+    except Exception as e:
+        print(f"     ⚠️  calibrate: derived-growth build failed ({e})")
+    DERIVED_GROWTH_RATES_LIVE = _derived_map
+    if _derived_map:
+        print(f"     📊 derived growth rates: {len(_derived_map)} players")
+
+    def _project(cname: str, stat: str, raw_val: int, verified_at) -> int:
+        """Advance a confirmed stat forward by the player's growth rate
+        × ticks-since-observation. Returns the projected current value
+        or the raw value if no growth data is available.
+
+        Rate selection: OBSERVED wins when > 0; DERIVED is the fallback
+        so players with only 1 data point still get a sensible projection
+        instead of staying frozen at the snapshot value."""
+        if raw_val <= 0:
+            return raw_val
+        if not isinstance(verified_at, datetime.datetime):
+            return raw_val
+        key = f"{stat}_per_tick"
+        obs_rates = _growth_map.get(cname) or {}
+        drv_rates = _derived_map.get(cname) or {}
+        rate = obs_rates.get(key, 0) or 0
+        if rate <= 0:
+            rate = drv_rates.get(key, 0) or 0
+        if rate <= 0:
+            return raw_val
+        ticks_since = max(0.0, (_cal_now - verified_at).total_seconds() / 1800.0)
+        if ticks_since <= 0:
+            return raw_val
+        return int(raw_val + rate * ticks_since)
+
+    projected_count = 0
     for cname, cs in confirmed_all.items():
+        # Bots follow a completely different stat curve than real players:
+        # they're mass-spawned with near-zero def (≈100) regardless of
+        # their leaderboard rank, which makes them poisonous anchors for
+        # the exponential rank-curve fit. A single Radagon at rank 1 with
+        # 530k def plus 50 bots at rank 75-82 with ~100 def produces a
+        # nonsense slope. Skip bots entirely for calibration; they still
+        # serve fine as battle targets via the estimates lookup path.
+        if '[bot]' in cname.lower():
+            bots_dropped += 1
+            continue
+
         p = profiles.get(cname, {})
-        # Current profile rank wins — it is always more up-to-date than the rank
-        # that was noted when the spy screenshot was taken.
-        ar  = p.get('off_rank',     0) or cs.get('off_rank',     0)
-        dr  = p.get('def_rank',     0) or cs.get('def_rank',     0)
-        sor = p.get('spy_off_rank', 0) or cs.get('spy_off_rank', 0)
-        sdr = p.get('spy_def_rank', 0) or cs.get('spy_def_rank', 0)
-        # Filter sentinel rank 999 ("unknown rank") and 0 at point-collection time.
-        if 0 < ar  < 900 and cs.get('atk',     0): atk_pts.append((ar,  cs['atk']))
-        if 0 < dr  < 900 and cs.get('def',     0): def_pts.append((dr,  cs['def']))
-        if 0 < sor < 900 and cs.get('spy_off', 0): spo_pts.append((sor, cs['spy_off']))
-        if 0 < sdr < 900 and cs.get('spy_def', 0): spd_pts.append((sdr, cs['spy_def']))
+        rs = _rank_snap_for_cal.get(cname, {})
+        # Rank priority (freshest first):
+        #   1. Profile scrape — rank at the moment the profile was fetched
+        #   2. Rank snapshot  — global leaderboard scrape this tick (covers
+        #                       all 250+ ranked players, not just the
+        #                       profile-scanned subset)
+        #   3. CS rank hint   — static fallback from hardcoded entries
+        ar  = p.get('off_rank',     0) or rs.get('off_rank',     0) or cs.get('off_rank',     0)
+        dr  = p.get('def_rank',     0) or rs.get('def_rank',     0) or cs.get('def_rank',     0)
+        sor = p.get('spy_off_rank', 0) or rs.get('spy_off_rank', 0) or cs.get('spy_off_rank', 0)
+        sdr = p.get('spy_def_rank', 0) or rs.get('spy_def_rank', 0) or cs.get('spy_def_rank', 0)
+        # Filter sentinel rank 999 ("unknown rank") and 0 at point-collection time,
+        # AND skip any stat whose verified_at is older than the freshness cutoff.
+        if 0 < ar  < 900 and cs.get('atk',     0):
+            if _is_fresh(cs, 'atk'):
+                raw = cs['atk']
+                proj = _project(cname, 'atk', raw, cs.get('atk_verified_at'))
+                if proj > raw: projected_count += 1
+                atk_pts.append((ar, proj))
+            else: stale_dropped['atk'] += 1
+        if 0 < dr  < 900 and cs.get('def',     0):
+            if _is_fresh(cs, 'def'):
+                raw = cs['def']
+                proj = _project(cname, 'def', raw, cs.get('def_verified_at'))
+                if proj > raw: projected_count += 1
+                def_pts.append((dr, proj))
+            else: stale_dropped['def'] += 1
+        if 0 < sor < 900 and cs.get('spy_off', 0):
+            if _is_fresh(cs, 'spy_off'):
+                raw = cs['spy_off']
+                proj = _project(cname, 'spy_off', raw, cs.get('spy_off_verified_at'))
+                spo_pts.append((sor, proj))
+            else: stale_dropped['spy_off'] += 1
+        if 0 < sdr < 900 and cs.get('spy_def', 0):
+            if _is_fresh(cs, 'spy_def'):
+                raw = cs['spy_def']
+                proj = _project(cname, 'spy_def', raw, cs.get('spy_def_verified_at'))
+                spd_pts.append((sdr, proj))
+            else: stale_dropped['spy_def'] += 1
+    if bots_dropped:
+        print(f"     🤖 calibrate: excluded {bots_dropped} [bot] row(s) from rank fit")
+    if projected_count:
+        print(f"     📈 calibrate: {projected_count} anchor(s) projected forward via growth rate")
+
+    total_stale = sum(stale_dropped.values())
+    if total_stale:
+        print(f"     🕒 calibrate: dropped stale anchors "
+              f"(>{CALIBRATION_FRESH_HOURS}h) "
+              f"atk={stale_dropped['atk']} def={stale_dropped['def']} "
+              f"spo={stale_dropped['spy_off']} spd={stale_dropped['spy_def']}")
 
     # Add YOUR live stats as the most-reliable anchor point
     # (rank scraped this tick from the server, stat read directly from the game)
@@ -5354,7 +7165,9 @@ def read_csv(path):
     with open(path, encoding='utf-8') as f:
         return list(csv.DictReader(f))
 
-def num(s): return int(re.sub(r'\D','',str(s or '')) or 0)
+# NOTE: num() is defined at line ~141 (K/M/B suffix-aware). A duplicate
+# definition used to live here and silently shadowed the full version,
+# breaking gold parsing for any "1.5M"-style input — removed 2026-04-16.
 
 # ── Load YOUR real confirmed stats ─────────────────────────────────────────────
 def load_your_stats():
@@ -5491,42 +7304,146 @@ def load_scraped_profiles():
 # dict so every fresh report immediately improves the per-player estimates.
 CONFIRMED_STATS_LIVE: dict = {}
 
+# Per-player growth rates — populated by calibrate_models() at the start
+# of each estimator run by calling compute_growth_rates(load_player_growth()).
+# estimate() reads this cache to project confirmed snapshots forward by
+# (rate × ticks_since_verified_at). Without this, fresh-confirmed values
+# (e.g. TGO 394k ATK recorded yesterday) stay frozen on the dashboard
+# even as the player levels up every tick.
+GROWTH_RATES_LIVE: dict = {}
+
+# Derived (formula-based) growth rates — populated by calibrate_models()
+# for every known player from their level / race / class / population via
+# derive_growth_rate(). Used as a FALLBACK projection when we don't yet
+# have 2+ observed data points to compute a real slope (and the GROWTH_RATES_LIVE
+# entry is 0). Observed always wins when > 0; derived fills the gap.
+DERIVED_GROWTH_RATES_LIVE: dict = {}
+
 CONFIRMED_STATS = {
     # Verified directly from in-game profile screenshots.
-    # atk/def/spy_off/spy_def are exact values — no estimation needed for these players.
-    # citizens_idle = idle citizens shown on their profile (not total population).
+    # atk/def/spy_off/spy_def are exact values AT THE TIME they were
+    # captured — treat them as FLOORS for estimate() (players grow),
+    # not as current-truth. The optional 'verified_at' field (ISO date
+    # string) is used by calibrate_models() to age-filter anchors:
+    # only recent-enough entries are fed to the rank fit, while the
+    # numbers themselves remain available as per-player floors.
+    #
+    # NOTE: level/race/cls fields are CAPTURE-TIME CONTEXT ONLY — they
+    # are NOT read by the optimizer at runtime.  Current demographics
+    # come from profile scraping + rank snapshots every tick.  Do not
+    # rely on these fields being accurate for long-term play.
     'Ashcipher': {
         'level': 19, 'race': 'Human', 'cls': 'Fighter',
         'atk': 76_408, 'def': 41_965, 'spy_off': 162,   'spy_def': 445,
         'gold': 980_667, 'bank': 1_720_000, 'citizens_idle': 332,
+        # no verified_at → not used as a calibration anchor
     },
-    # verified from in-game profile screenshot 2026-04-15
     'Mungus': {
         'level': 30, 'race': 'Undead', 'cls': 'Thief',
         'atk': 323_975, 'def': 96_973, 'spy_off': 210, 'spy_def': 910,
+        'verified_at': '2026-04-15',
     },
-    # verified from in-game profile screenshot 2026-04-15
     'Mettalica': {
-        'level': 27, 'race': 'Goblin', 'cls': 'Cleric',
-        'atk': 239_492, 'def': 38_442, 'spy_off': 26_130, 'spy_def': 22_880,
+        'level': 30, 'race': 'Goblin', 'cls': 'Cleric',
+        'atk': 318_936, 'def': 56_352, 'spy_off': 49_219, 'spy_def': 24_525,
         'gold': 28_797, 'bank': 14_050_000, 'citizens_idle': 16,
+        'verified_at': {
+            'atk':     '2026-04-16 21:53',
+            'def':     '2026-04-16 21:53',
+            'spy_off': '2026-04-16 21:53',
+            'spy_def': '2026-04-16 21:53',
+        },
     },
     'JT': {
         'level': 15, 'race': 'Goblin', 'cls': 'Thief',
-        'atk': 19_145, 'def': 14_423, 'spy_off': 210,   'spy_def':  90,
+        'atk': 19_145, 'def': 26_000, 'spy_off': 210,   'spy_def': 28_000,
         'gold':    782, 'bank': 1_010_000, 'citizens_idle': 1_385,
+        'verified_at': {
+            'def':     '2026-04-16',   # fresh — user intel
+            'spy_def': '2026-04-16',   # fresh — user intel
+            # atk / spy_off unchanged since original capture; no verified_at
+            # → not fed to calibration, but still act as per-player floors.
+        },
     },
-    # verified from dashboard row 2026-04-15 (Fort HP 3000/3000 = Fort Lv2)
-    # atk/def are the values at time of spy — treat as FLOOR, not ceiling.
-    # Current rank comes from live profile scrape (private_player_profiles.csv).
     'TGO Jasbob1989': {
         'level': 29, 'race': 'Undead', 'cls': 'Fighter',
-        'atk': 394_000, 'def': 120_000,
+        'atk': 545_000, 'def': 120_000,
+        'verified_at': {
+            'atk': '2026-04-16',   # fresh user confirmation
+            'def': '2026-04-15',   # older — def value is a floor only
+        },
     },
-    # verified from profile screenshot 2026-04-08 — stats are a snapshot floor.
+    # User-confirmed DEF values from Discord / in-game intel (2026-04-16).
+    # Full spy report 2026-04-16 — all four combat stats + level bump.
+    'Tycoon': {
+        'level': 28, 'race': 'Goblin', 'cls': 'Cleric',
+        'atk': 281_610, 'def': 388_584,
+        'spy_off': 22_018, 'spy_def': 31_370,
+        'verified_at': {
+            'atk':     '2026-04-16',
+            'def':     '2026-04-16',
+            'spy_off': '2026-04-16',
+            'spy_def': '2026-04-16',
+        },
+    },
+    'aminmetz': {
+        'level': 21, 'race': 'Elf', 'cls': 'Cleric',
+        'def': 166_000,
+        'verified_at': {'def': '2026-04-16'},
+    },
+    # Full spy report 2026-04-16 20:23 — def-focused Cleric, rank-7 DEF anchor.
+    'Carrot': {
+        'level': 29, 'race': 'Elf', 'cls': 'Cleric',
+        'atk': 188_264, 'def': 359_970,
+        'spy_off': 414, 'spy_def': 2_130,
+        'gold': 100_856, 'bank': 0, 'citizens_idle': 44,
+        'verified_at': {
+            'atk':     '2026-04-16 20:23',
+            'def':     '2026-04-16 20:23',
+            'spy_off': '2026-04-16 20:23',
+            'spy_def': '2026-04-16 20:23',
+        },
+    },
+    # Spy report 2026-04-17 — mid-rank anchor (off 16 / def 42).  Fort
+    # HP 1,000/1,000 = Fortification level 0/1 (minimal fort investment).
+    'Barney': {
+        'level': 29, 'race': 'Elf', 'cls': 'Cleric',
+        'atk': 146_617, 'def': 80_723,
+        'spy_off': 315, 'spy_def': 8_600,
+        'verified_at': {
+            'atk':     '2026-04-17',
+            'def':     '2026-04-17',
+            'spy_off': '2026-04-17',
+            'spy_def': '2026-04-17',
+        },
+    },
+    # Spy report 2026-04-17 — Undead Thief, balanced build (ATK 104k /
+    # DEF 129k), strong spy for his rank.  Fort HP 3k/3k = Fort level 2.
+    'Chill': {
+        'level': 28, 'race': 'Undead', 'cls': 'Thief',
+        'atk': 104_782, 'def': 129_736,
+        'spy_off': 11_523, 'spy_def': 13_610,
+        'verified_at': {
+            'atk':     '2026-04-17',
+            'def':     '2026-04-17',
+            'spy_off': '2026-04-17',
+            'spy_def': '2026-04-17',
+        },
+    },
+    # DEF was re-confirmed 2026-04-15 via Discord screenshot from the
+    # player (handle 'Ragnawar'): "Top def is mine: 530k". The other
+    # combat stats are still from the April 8 profile screenshot — too
+    # old to anchor the rank curves for atk/spy but still useful as
+    # floors. Per-stat verified_at so only def is fed to calibration.
     'Radagon Of The Golden Order': {
         'level': 18, 'race': 'Goblin', 'cls': 'Cleric',
-        'atk':  9_611, 'def': 77_457, 'spy_off': 4_226, 'spy_def': 3_760,
+        'atk':  9_611, 'def': 530_000, 'spy_off': 4_226, 'spy_def': 3_760,
+        'verified_at': {
+            'def': '2026-04-15',   # fresh — Discord confirmation
+            'atk':     '2026-04-08',
+            'spy_off': '2026-04-08',
+            'spy_def': '2026-04-08',
+        },
     },
 }
 
@@ -5542,9 +7459,9 @@ PLAYERS = [
     ('Nerv',                       20,'Human',  'Fighter', 2754,'TGO',  99, 99, 99),
     ('Radagon Of The Golden Order',18,'Goblin', 'Cleric',  2600,'TGO',  99, 99, 99),
     ('sirclement_xxviii',          18,'Undead', 'Assassin',2647,'—',    99, 99, 99),
-    ('Tycoon',                     15,'Goblin', 'Cleric',  2700,'RQUM', 99, 99, 99),
+    ('Tycoon',                     28,'Goblin', 'Cleric',  2700,'RQUM', 99, 99, 99),
     ('TGO_Gaara',                  18,'—',      '—',       2500,'TGO',  99, 99, 99),
-    ('Carrot',                     21,'Elf',    'Cleric',  2688,'—',    99, 99, 99),
+    ('Carrot',                     29,'Elf',    'Cleric',  2688,'RQUM', 99, 99, 99),
     ('NapoleonBorntoparty',        13,'Goblin', 'Thief',   2500,'TGO',  99, 99, 99),
     ('Hesiana',                    18,'—',      '—',       2500,'—',    99, 99, 99),
     ('Mungus',                     30,'Undead', 'Thief',   2556,'RQUM', 99, 99, 99),
@@ -5560,7 +7477,8 @@ PLAYERS = [
     ('Don Gato',                   13,'—',      '—',       2500,'HNTC', 99, 99, 99),
     ('It was a fun time',          19,'—',      '—',       2500,'—',    99, 99, 99),
     ('Punching bag waiting for reset',19,'—',   '—',       2500,'TGO',  99, 99, 99),
-    ('Chill',                      19,'—',      '—',       2500,'—',    99, 99, 99),
+    ('Chill',                      28,'Undead', 'Thief',   2500,'RQUM', 99, 99, 99),
+    ('Barney',                     29,'Elf',    'Cleric',  2500,'RQUM', 99, 99, 99),
     ('Hes',                        13,'Elf',    'Cleric',  2500,'—',    99, 99, 99),
     ('The Defender',               15,'Goblin', 'Cleric',  2813,'HNTC', 99, 99, 99),
     ('Division Bell',              13,'Elf',    'Thief',   2500,'HNTC', 99, 99, 99),
@@ -5578,22 +7496,100 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
     rb = RACE.get(race, RACE['Human'])
     cb = CLASS.get(cls,  CLASS['Fighter'])
 
-    # ── CONFIRMED: demographic data from profile screenshots + intel ────────
-    # Level/race/cls are stable — use them.  Combat stats (atk/def/spy) may be
-    # weeks old; compare them to the rank-calibrated model and use whichever is
-    # HIGHER (players only get stronger over time, never weaker).
-    # Population ceiling (see below) guards against impossibly large values.
+    # ── Phase 3: rich-intel overrides ───────────────────────────────────────
+    # When the caller supplies a fresh rich_intel snapshot (from Phase 1's
+    # private_target_intel.json), compute EXACT values for income/mine/fort
+    # and expose ATK/DEF reconstructions + building levels + fort damage.
+    # Freshness gate matches calibrate_models (48h) — beyond that the state
+    # has drifted so we only trust the rich_intel as a floor, not current-truth.
+    rich_intel       = kwargs.get('rich_intel') or None
+    rich_fresh       = bool(rich_intel) and _is_rich_intel_fresh(rich_intel)
+    rich_income      = _exact_income_from_intel(rich_intel, race, cls) if rich_fresh else None
+    rich_atk_rx      = _reconstruct_stat_from_intel(rich_intel, race, cls, 'atk') if rich_fresh else None
+    rich_def_rx      = _reconstruct_stat_from_intel(rich_intel, race, cls, 'def') if rich_fresh else None
+    rich_fort_damage = _fort_damage_pct(rich_intel)   # None if no fort fields
+
+    def _apply_rich_overrides(result: dict) -> dict:
+        """Final step before returning: replace approximations with exact
+        values when rich intel is fresh, and publish additional fields
+        (fort state, building levels, reconstructions) for consumers.
+        Also stamps the Phase 4 conf_score on every return path so
+        consumers (dashboard, battle targeting) can filter by confidence."""
+        # Phase 4: confidence score — computed for EVERY return path,
+        # not just the rich-intel one.  Inputs are determined from what
+        # we know about this player when estimate() was called.
+        _cs_entry = (CONFIRMED_STATS_LIVE or CONFIRMED_STATS).get(clean, {})
+        has_any_cs = bool(_cs_entry)
+        _obs_rates = (GROWTH_RATES_LIVE or {}).get(clean, {})
+        has_growth = bool(_obs_rates) and any(
+            (_obs_rates.get(k, 0) or 0) > 0
+            for k in ("atk_per_tick", "def_per_tick", "spy_off_per_tick", "spy_def_per_tick")
+        )
+        result['conf_score'] = round(_confidence_score(
+            name                 = clean,
+            race                 = race,
+            cls                  = cls,
+            has_fresh_rich       = rich_fresh,
+            has_stale_confirmed  = has_any_cs and not rich_fresh,
+            has_observed_growth  = has_growth,
+        ), 3)
+
+        if not rich_fresh:
+            return result
+        bld = (rich_intel or {}).get('buildings', {}) or {}
+        army_detail_here = (rich_intel or {}).get('army_detail', {}) or {}
+        # Exact income always wins when we can compute it — more accurate
+        # than est_mine_lv(level) + pop * 0.80 guess.
+        if rich_income is not None:
+            result['income'] = rich_income
+        if 'mine' in bld:
+            result['mine_lv'] = int(bld['mine'])
+        # Building levels exposed for dashboard / growth model consumers
+        for src, dst in (
+            ('fortification',  'fortification_lv'),
+            ('armory',         'armory_lv'),
+            ('spy_academy',    'spy_academy_lv'),
+            ('housing',        'housing_lv'),
+            ('barracks',       'barracks_lv'),
+            ('mercenary_camp', 'mercenary_camp_lv'),
+        ):
+            if src in bld:
+                result[dst] = int(bld[src])
+        # Fort state for attackers planning damage
+        if 'fort_hp' in (rich_intel or {}):
+            result['fort_hp']      = int(rich_intel['fort_hp']      or 0)
+            result['fort_max']     = int(rich_intel.get('fort_max',   0) or 0)
+            if rich_fort_damage is not None:
+                result['fort_damage_pct'] = round(rich_fort_damage, 4)
+        # ATK/DEF reconstruction for debugging + Phase-4 prediction.  We
+        # DON'T replace result['atk'] / result['def'] with the reconstruction
+        # here — the reported Total Offense / Total Defense (stored in CS
+        # as 'atk'/'def' when captured) is the authoritative in-game value
+        # and already reflects game-side bonuses we may not model perfectly.
+        # The reconstruction is useful as a cross-check and as a basis for
+        # "if they train N more knights next tick, ATK = ...".
+        if rich_atk_rx is not None:
+            result['atk_reconstructed'] = int(rich_atk_rx)
+        if rich_def_rx is not None:
+            result['def_reconstructed'] = int(rich_def_rx)
+        # Exact army composition (per-unit stats) — useful for Phase 4
+        # predictions ("next tick they buy 10 Knights → ATK +X").
+        if army_detail_here:
+            result['army_detail'] = army_detail_here
+        return result
+
+    # ── CONFIRMED: combat-stat anchors from profile screenshots + intel ─────
+    # Level/race/cls come from the caller (profile scrape + rank snapshot —
+    # always fresher than hardcoded CS entries, since players level every
+    # few hours).  CS is used ONLY for atk/def/spy anchors; values may be
+    # weeks old, so we compare against the rank-calibrated model and use
+    # whichever is HIGHER (players only grow, never shrink).  Population
+    # ceiling (see below) guards against impossibly large values.
     # CONFIRMED_STATS_LIVE is the merged dict (hardcoded + intel from reports);
     # fall back to raw CONFIRMED_STATS when calibrate_models hasn't run yet.
     _cs_source = CONFIRMED_STATS_LIVE or CONFIRMED_STATS
     if clean in _cs_source:
         c = _cs_source[clean]
-        # Stable demographic overrides
-        level = c.get('level', level)
-        race  = c.get('race',  race)
-        cls   = c.get('cls',   cls)
-        rb = RACE.get(race, RACE['Human'])
-        cb = CLASS.get(cls,  CLASS['Fighter'])
         mine_lv = est_mine_lv(level)
         workers = int(pop * 0.80)
         income  = int((BASE_INC + workers * WORKER_GOLD) * mine_mult(mine_lv)
@@ -5605,14 +7601,54 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
         cal_def = rank_def(def_rank) if def_rank < 900 else 0
         cal_so  = rank_spy_off(s_off) if s_off < 900 else 0
         cal_sd  = rank_spy_def(s_def) if s_def < 900 else 0
-        # Confirmed spy stats are a FLOOR (minimum observed value), not a ceiling.
-        # Players only grow stronger over time — if the rank model estimates a higher
-        # value than the last spy reading, the model is probably right.
-        # Use max(confirmed_floor, model_estimate) so estimates keep up with growth.
-        atk_v = max(c.get('atk',     0), cal_atk)
-        def_v = max(c.get('def',     0), cal_def)
-        spo_v = max(c.get('spy_off', 0), cal_so)
-        spd_v = max(c.get('spy_def', 0), cal_sd)
+        # Stat selection: FRESH vs STALE confirmed values, with growth
+        # projection applied to fresh values so the dashboard doesn't
+        # show yesterday's snapshot frozen while the player keeps growing.
+        #
+        # FRESH (verified_at within CALIBRATION_FRESH_HOURS):
+        #   Start from the confirmed value (ground truth at capture time)
+        #   and project forward by the player's observed growth rate:
+        #       projected = confirmed + rate_per_tick × ticks_since
+        #   then compare against the rank-model estimate and pick the
+        #   higher of the two (model may be even more accurate if rank
+        #   just shifted). This keeps confirmed stats from going stale.
+        #
+        # STALE (old or no verified_at):
+        #   Fall back to max(confirmed_floor, model) — the confirmed
+        #   value is too old to project reliably, so treat it as a
+        #   lower bound and let the model drive.
+        _now_est       = datetime.datetime.now()
+        _cal_cutoff    = _now_est - datetime.timedelta(hours=CALIBRATION_FRESH_HOURS)
+        _rates         = GROWTH_RATES_LIVE.get(clean, {}) if GROWTH_RATES_LIVE else {}
+        _derived_rates = DERIVED_GROWTH_RATES_LIVE.get(clean, {}) if DERIVED_GROWTH_RATES_LIVE else {}
+        def _pick_stat(stat_key, confirmed_val, model_val):
+            vat = c.get(f'{stat_key}_verified_at')
+            is_fresh = (isinstance(vat, datetime.datetime)
+                        and vat >= _cal_cutoff
+                        and confirmed_val > 0)
+            if is_fresh:
+                # Project the confirmed value forward by growth rate.
+                # OBSERVED wins when > 0 (real measured growth);
+                # DERIVED is the fallback so players without enough
+                # history still get a sensible projection.
+                observed = _rates.get(f'{stat_key}_per_tick', 0) or 0
+                derived  = _derived_rates.get(f'{stat_key}_per_tick', 0) or 0
+                rate     = observed if observed > 0 else derived
+                if rate > 0:
+                    ticks = max(0.0, (_now_est - vat).total_seconds() / 1800.0)
+                    projected = int(confirmed_val + rate * ticks)
+                else:
+                    projected = confirmed_val
+                # Use the HIGHER of (projected confirmed) and (rank model)
+                # — the model may reflect rank movement that growth rate
+                # alone doesn't capture.
+                return max(projected, model_val)
+            # Stale — use floor + model
+            return max(confirmed_val, model_val)
+        atk_v = _pick_stat('atk',     c.get('atk',     0), cal_atk)
+        def_v = _pick_stat('def',     c.get('def',     0), cal_def)
+        spo_v = _pick_stat('spy_off', c.get('spy_off', 0), cal_so)
+        spd_v = _pick_stat('spy_def', c.get('spy_def', 0), cal_sd)
         # Population ceiling: a player CANNOT have more stat than their ENTIRE
         # population fully equipped.  Caps unrealistic model outliers.
         gt = max_gear_tier(level);  ut = max_unit_tier(level)
@@ -5621,7 +7657,7 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
         atk_v = min(atk_v, int(pop * max_atk_pu * 1.10))
         def_v = min(def_v, int(pop * max_def_pu * 1.10))
         conf  = 'CONFIRMED'
-        return {
+        return _apply_rich_overrides({
             'pop':       pop,     'workers':   workers,
             'off_u':     '?',     'def_u':     '?',
             'spy_u':     '?',     'sent_u':    '?',
@@ -5633,10 +7669,10 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
             'army_size': kwargs.get('army_size', 0),
             'upgrades':  max(0, kwargs.get('building_upgrades', -1)),
             'conf':      conf,
-        }
+        })
 
     if is_you:
-        return {
+        return _apply_rich_overrides({
             'pop':       you['population'],
             'workers':   you['workers'],
             'off_u':     you['off_units'],
@@ -5654,7 +7690,7 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
             'army_size': kwargs.get('army_size', 0),
             'upgrades':  max(0, kwargs.get('building_upgrades', -1)),
             'conf':      'CONFIRMED',
-        }
+        })
 
     # ── What we can derive precisely ─────────────────────────────────────────
     # 1. Max gear tier: gated by Armory level, which requires Level 10
@@ -5781,7 +7817,7 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
     elif level >= 10:                       conf = 'UPPER BOUND'
     else:                                   conf = 'UB (T3 lv<10)'
 
-    return {
+    return _apply_rich_overrides({
         'pop':        pop,       'workers':   workers,
         'off_u':      off_u,     'def_u':     def_u,
         'spy_u':      spy_u,     'sent_u':    sent_u,
@@ -5791,7 +7827,7 @@ def estimate(name, level, race, cls, pop, clan, overall, off_rank, def_rank, you
         'gear_t':     gear_t,    'unit_t':    unit_t,
         'army_size':  army_size, 'upgrades':  max(0, building_upgrades),
         'conf':       conf,
-    }
+    })
 
 # ── GitHub publish ─────────────────────────────────────────────────────────────
 def publish_estimates(ts: str):
@@ -6113,6 +8149,10 @@ function rankBadge(n) {{
 }}
 
 function isBot(r) {{
+  // Prefer the explicit IsBot column (written by estimator_run) — it's
+  // authoritative. Fall back to name-pattern detection for older rows
+  // that predate the column.
+  if (r && (r.IsBot === 1 || r.IsBot === '1' || r.IsBot === true)) return true;
   return (r.Player || '').toLowerCase().includes('[bot]') ||
          (r.Player || '').toLowerCase().startsWith('bot');
 }}
@@ -6202,15 +8242,20 @@ function updateSortHeaders() {{
 
 function renderCards(rows) {{
   const you = RAW.find(r => (r.Player||'').toLowerCase().includes('beginner'));
-  const allSorted = (col) => [...RAW].sort((a,b) => (b[col]||0)-(a[col]||0));
+  // Live in-game leaderboards EXCLUDE bots, so our rank cards must too —
+  // otherwise rank #1 in the card disagrees with what the game shows.
+  // Bots stay in the CSV + table (they're valid auto-battle targets) but
+  // are filtered out of ranking math here.
+  const nonBot    = RAW.filter(r => !isBot(r));
+  const allSorted = (col) => [...nonBot].sort((a,b) => (b[col]||0)-(a[col]||0));
 
-  // Use actual server-wide ranks if available, else fall back to rank within tracked players
+  // Use actual server-wide ranks if available, else fall back to rank within tracked non-bot players
   const atkRank = SERVER_ATK_RANK > 0 ? SERVER_ATK_RANK
                 : (you ? allSorted('EstATK').findIndex(r=>r.Player===you.Player)+1 : '?');
   const defRank = SERVER_DEF_RANK > 0 ? SERVER_DEF_RANK
                 : (you ? allSorted('EstDEF').findIndex(r=>r.Player===you.Player)+1 : '?');
-  const top1atk = RAW.reduce((a,b)=>(a.EstATK||0)>(b.EstATK||0)?a:b, RAW[0]);
-  const top1def = RAW.reduce((a,b)=>(a.EstDEF||0)>(b.EstDEF||0)?a:b, RAW[0]);
+  const top1atk = nonBot.reduce((a,b)=>(a.EstATK||0)>(b.EstATK||0)?a:b, nonBot[0] || RAW[0]);
+  const top1def = nonBot.reduce((a,b)=>(a.EstDEF||0)>(b.EstDEF||0)?a:b, nonBot[0] || RAW[0]);
 
   document.getElementById('cards').innerHTML = `
     <div class="card">
@@ -6322,6 +8367,16 @@ def estimator_run():
 
     # Load army leaderboard snapshot (written by scrape_army_leaderboards)
     army_snap = load_army_snapshot()
+    # Phase 3: rich per-target intel from private_target_intel.json.  Each
+    # entry carries exact building levels, army composition, armory inventory,
+    # battle upgrades, and fort state — used by estimate() via the rich_intel
+    # kwarg to publish precise values (income, mine_lv, fort_damage_pct) for
+    # players we've spied within the freshness window.
+    try:
+        target_intel_snap = load_target_intel_snapshot()
+    except Exception as _e:
+        print(f"  ⚠️  target-intel snapshot load failed: {_e}")
+        target_intel_snap = {}
 
     # ── Merge scraped profiles into PLAYERS list ──────────────────────────────
     # Any player found by the sequential profile scrape but NOT in PLAYERS gets
@@ -6348,42 +8403,49 @@ def estimator_run():
         print(f"  ℹ️  {len(extra_players)} extra players discovered from profile scan — added to estimates")
 
     # Also include players from the rankings snapshot who are NOT already in PLAYERS
-    # or profile-scraped.  We know their server rank + level (often), so the model
+    # or profile-scraped.  We know their server rank, so the rank-calibrated model
     # can produce meaningful ATK/DEF estimates for them — critical for the TOP
-    # ATK/DEF ranking to reflect the full server, not just the ~30-entry PLAYERS list.
+    # ATK/DEF ranking + YOUR-rank calculation to reflect the full server, not just
+    # the ~30-entry PLAYERS list.
+    #
+    # The rankings snapshot doesn't include level (it's scraped from the
+    # rankings pages, not individual profile pages).  When level is missing we
+    # infer a placeholder from overall rank: rank 1 ≈ lv 30, rank 250 ≈ lv 5.
+    # The rank model uses the player's ACTUAL rank for atk/def estimation, so
+    # this placeholder level only affects income/population defaults (which
+    # matter less at display time).
     snap_known = known_names | {p[0] for p in extra_players}
     rank_snap_extra = []
     for pname, rs in rank_snap.items():
         if pname in snap_known or 'YOU' in pname:
             continue
-        lv = rs.get('level', 0)
+        if not (rs.get('off_rank') or rs.get('def_rank') or rs.get('overall')):
+            continue   # skip players with no rank info at all
+        lv = rs.get('level', 0) or 0
         if lv == 0:
-            continue
+            # Linear placeholder: rank 1 → lv 30; falls off linearly by total.
+            overall = rs.get('overall', 999) or 999
+            if 0 < overall < 900:
+                lv = max(1, int(30 - overall * 25.0 / max(1, total_players)))
+            else:
+                lv = 10   # fallback — middle of the pack
         rank_snap_extra.append((
             pname,
             lv,
             rs.get('race',       '—'),
             rs.get('cls',        '—'),
-            rs.get('population',   0),
+            rs.get('population',   0) or 2500,   # placeholder for pop ceiling math
             rs.get('clan',       '—'),
-            rs.get('overall',    999),
-            rs.get('off_rank',   999),
-            rs.get('def_rank',   999),
+            rs.get('overall',    999) or 999,
+            rs.get('off_rank',   999) or 999,
+            rs.get('def_rank',   999) or 999,
         ))
     if rank_snap_extra:
         print(f"  ℹ️  {len(rank_snap_extra)} additional players injected from rankings snapshot")
     extra_players.extend(rank_snap_extra)
 
-    print(f'\n{"="*150}')
-    print(f'  PLAYER ESTIMATES — {ts}  (gear tiers from exact armory data)')
-    print(f'{"="*150}')
-    hdr = (f'{"Player":<26} {"Clan":<5} {"Lv":>3} {"Race":<8} {"Class":<10} '
-           f'{"Pop":>5} {"Army":>6} {"Upg":>4} {"Off":>5} {"Def":>5} {"Spy":>5} '
-           f'{"GearT":>6} {"UnitT":>6} '
-           f'{"ATK":>9} {"DEF":>9} {"SpyOff":>8} {"SpyDef":>8} '
-           f'{"Inc/tick":>10} {"Inc/day":>9} {"Conf":<10}')
-    print(hdr)
-    print('-' * 150)
+    # Estimator runs silently — only top-10 summary is printed at the end
+    # (the full per-player table was removed to keep the activity log clean).
 
     for name, level, race, cls, pop, clan, overall, off_rank, def_rank in PLAYERS + extra_players:
         clean = name.replace(' (YOU)', '')
@@ -6417,12 +8479,10 @@ def estimator_run():
             if rs.get('spy_off_rank',0) > 0:   spy_off_rank = rs['spy_off_rank']
             if rs.get('spy_def_rank',0) > 0:   spy_def_rank = rs['spy_def_rank']
 
-        # CONFIRMED_STATS always override level/race/cls
-        if clean in CONFIRMED_STATS:
-            c = CONFIRMED_STATS[clean]
-            if c.get('level', 0) > 0: level = c['level']
-            if c.get('race',  ''):    race  = c['race']
-            if c.get('cls',   ''):    cls   = c['cls']
+        # CONFIRMED_STATS is for combat-stat anchors only (atk/def/spy_*),
+        # consumed by calibrate_models().  Demographics (level/race/cls) go
+        # stale quickly — players level up every few hours — so we rely on
+        # profile scrape + rank snapshot above, never on hardcoded values.
 
         # YOUR live optimizer data always wins last — most accurate source
         if 'YOU' in name:
@@ -6437,20 +8497,14 @@ def estimator_run():
                      spy_def_rank     = spy_def_rank,
                      army_size        = ad.get('army_size',         0),
                      building_upgrades= ad.get('building_upgrades', -1),
-                     units_trained    = ad.get('units_trained',      0))
+                     units_trained    = ad.get('units_trained',      0),
+                     rich_intel       = target_intel_snap.get(clean))
+        # Per-player line stored for post-loop top-10 summary (not printed
+        # individually — 300+ lines floods the activity log).
         tag = '← YOU' if 'YOU' in name else ''
-        fmt_u  = lambda v: f'{v:>5,}' if isinstance(v, int) else f'{"?":>5}'
-        fmt_a  = lambda v: f'{v:>6,}' if v > 0 else f'{"—":>6}'
-        fmt_up = lambda v: f'{v:>4}' if v >= 0 else f'{"?":>4}'
-        disp_lv = CONFIRMED_STATS[clean]['level'] if clean in CONFIRMED_STATS else level
-        print(
-            f'{name:<26} {clan:<5} {disp_lv:>3} {race:<8} {cls:<10} '
-            f'{e["pop"]:>5,} {fmt_a(e["army_size"])} {fmt_up(e["upgrades"])} '
-            f'{fmt_u(e["off_u"])} {fmt_u(e["def_u"])} '
-            f'{fmt_u(e["spy_u"])} {fmt_u(e["sent_u"])} '
-            f'{e["gear_t"]:>6} {e["unit_t"]:>6} '
-            f'{e["atk"]:>9,} {e["def"]:>9,} {e["spy_off"]:>8,} {e["spy_def"]:>8,} '
-            f'{e["income"]:>10,} {e["income"]*TICKS/1e6:>8.1f}M  {e["conf"]:<10} {tag}'
+        _print_line = (
+            f'{clean:<26} Lv{level:>2} {e["atk"]:>9,} ATK  '
+            f'{e["def"]:>9,} DEF  {e["conf"]:<10} {tag}'
         )
         results.append({
             'Timestamp': ts, 'Player': clean, 'Clan': clan,
@@ -6465,6 +8519,15 @@ def estimator_run():
             'EstSpyOff': e['spy_off'], 'EstSpyDef': e['spy_def'],
             'EstIncomeTick': e['income'], 'EstIncomeDay': e['income'] * TICKS,
             'MineLv': e['mine_lv'], 'Confidence': e['conf'],
+            # Phase 4: data-driven confidence [0,1] — higher = more trust.
+            # Rolls in freshness of rich intel, known demographics, observed
+            # growth rate, and historical projection-vs-actual error.
+            'ConfScore': e.get('conf_score', 0.0),
+            # Bots are still valid auto-battle targets, but the live
+            # in-game leaderboards exclude them — so the dashboard's rank
+            # cards need a way to filter them out of EstATK/EstDEF
+            # ordering to match what the user sees in-game.
+            'IsBot': 1 if '[bot]' in clean.lower() else 0,
         })
 
     # Save CSV — always overwrite so header never goes stale
@@ -6475,6 +8538,14 @@ def estimator_run():
         w.writerows(results)
     print(f'\n✅ Saved to {OUTPUT}')
 
+    # Phase 4: append today's projections to private_projection_log.csv so
+    # future intel captures can measure how accurate we were.  NOT part of
+    # the growth CSV (different purpose + different retention window).
+    try:
+        record_projections(results)
+    except Exception as _pe:
+        print(f'  ⚠️  projection log append failed: {_pe}')
+
     # Save HTML dashboard
     write_html_report(results, ts)
     print(f'✅ Saved to private_player_estimates.html')
@@ -6482,12 +8553,28 @@ def estimator_run():
     # Publish to GitHub Pages
     publish_estimates(ts)
 
-    # Summary
+    # NOTE: we deliberately DON'T record estimator output to the growth CSV.
+    # Writing projected model values back as "observations" creates a
+    # feedback loop: projection → growth CSV → higher observed rate →
+    # bigger projection next tick → explosion. Only spy-report intel
+    # (via record_intel → record_player_growth with source="intel")
+    # should contribute to observed growth rates. The derived-rate
+    # fallback in calibrate_models covers players without intel history.
+
+    # Summary — show top 10 ATK + DEF instead of flooding 300+ lines
     by_atk  = sorted(results, key=lambda x: -x['EstATK'])
     by_def  = sorted(results, key=lambda x: -x['EstDEF'])
+    nonbot  = [r for r in results if '[bot]' not in r['Player'].lower()]
     you_r   = next(r for r in results if 'Beginner' in r['Player'])
-    print(f'\n  TOP ATK: ' + '  '.join(f'{r["Player"].split()[0]}={r["EstATK"]:,}' for r in by_atk[:5]))
-    print(f'  TOP DEF: ' + '  '.join(f'{r["Player"].split()[0]}={r["EstDEF"]:,}' for r in by_def[:5]))
+    print(f'\n  📊 Estimated {len(results)} players ({len(nonbot)} non-bot)')
+    print(f'  ── TOP 10 ATK ──')
+    for i, r in enumerate(by_atk[:10], 1):
+        tag = ' ← YOU' if 'Beginner' in r['Player'] else ''
+        print(f'    {i:>2}. {r["Player"]:<26} ATK={r["EstATK"]:>9,}  DEF={r["EstDEF"]:>9,}  {r["Confidence"]:<10}{tag}')
+    print(f'  ── TOP 10 DEF ──')
+    for i, r in enumerate(by_def[:10], 1):
+        tag = ' ← YOU' if 'Beginner' in r['Player'] else ''
+        print(f'    {i:>2}. {r["Player"]:<26} DEF={r["EstDEF"]:>9,}  ATK={r["EstATK"]:>9,}  {r["Confidence"]:<10}{tag}')
     you_ar = sorted(results, key=lambda x:-x['EstATK']).index(you_r)+1
     you_dr = sorted(results, key=lambda x:-x['EstDEF']).index(you_r)+1
     # Use actual server ranks if available in private_latest.json
