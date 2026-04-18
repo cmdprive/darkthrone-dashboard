@@ -16,7 +16,7 @@ set PATH=%PYBIN%;%PATH%
 
 :: ── Step 1: Install build tools ───────────────────────────────────────────
 echo  [1/5] Installing build tools...
-python -m pip install pyinstaller --quiet
+python -m pip install pyinstaller anthropic --quiet
 if errorlevel 1 (
     echo  [ERROR] Could not install build tools.
     pause & exit /b 1
@@ -27,7 +27,8 @@ echo.
 echo  [2/5] Compiling source to bytecode...
 python -m compileall -b -q ^
     installer\darkthrone_app.py ^
-    optimizer.py
+    optimizer.py ^
+    claude_strategy.py
 if errorlevel 1 (
     echo  [ERROR] Bytecode compilation failed.
     pause & exit /b 1
@@ -44,11 +45,14 @@ pyinstaller ^
     --noconsole ^
     --name "DarkThrone Suite" ^
     --add-data "optimizer.pyc;." ^
+    --add-data "claude_strategy.pyc;." ^
     --add-data "index.html;." ^
     --add-data "_version.py;." ^
     --add-data "installer\updater.py;." ^
     --hidden-import "_version" ^
     --hidden-import "updater" ^
+    --hidden-import "claude_strategy" ^
+    --hidden-import "anthropic" ^
     --hidden-import "playwright" ^
     --hidden-import "playwright.sync_api" ^
     --hidden-import "playwright.__main__" ^
@@ -56,6 +60,7 @@ pyinstaller ^
     --hidden-import "tkinter.ttk" ^
     --hidden-import "tkinter.scrolledtext" ^
     --collect-all "playwright" ^
+    --collect-all "anthropic" ^
     --noconfirm ^
     installer\darkthrone_app.py
 

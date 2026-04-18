@@ -152,9 +152,11 @@ CLASSES = ["Fighter", "Cleric", "Thief", "Assassin"]
 # Legacy keys (balanced/attack/defense/economy/spy/hybrid) are auto-migrated
 # to the new 3-profile set at config-load time via _LEGACY_STRAT_MAP below.
 STRATEGY_LABELS = {
-    "grow":   {"label": "📈  Grow",   "desc": "Net worth focus — income + cheap army + XP for unlocks"},
-    "combat": {"label": "⚔️  Combat", "desc": "ATK-heavy — maximize offensive power for farming + PvP"},
-    "defend": {"label": "🛡️  Defend", "desc": "DEF-heavy — survive attacks, protect bank + rank"},
+    "grow":        {"label": "📈  Grow",   "desc": "Net worth focus — income + cheap army + XP for unlocks"},
+    "combat":      {"label": "⚔️  Combat", "desc": "ATK-heavy — maximize offensive power for farming + PvP"},
+    "defend":      {"label": "🛡️  Defend", "desc": "DEF-heavy — survive attacks, protect bank + rank"},
+    "claude-auto": {"label": "🧠  Autonomous Claude",
+                    "desc": "LLM reasons from game mechanics each tick — requires API key (≈$0.60/day)"},
 }
 
 # Legacy → new strategy key migration.  Any old user_config.json with
@@ -815,11 +817,11 @@ class DarkThroneApp:
 
     # ── Settings popup (opened via ⚙ in header) ──────────────────────────────
     def _open_settings_popup(self):
-        """Open a small modal window for Race/Class settings."""
+        """Open a small modal window for Race/Class + Claude-strategy settings."""
         win = tk.Toplevel(self.root)
         win.title("Settings")
         win.configure(bg=C["card"])
-        win.geometry("300x220")
+        win.geometry("420x420")
         win.resizable(False, False)
         win.transient(self.root)
         win.grab_set()
@@ -853,7 +855,96 @@ class DarkThroneApp:
 
         tk.Frame(win, bg=C["border"], height=1).pack(fill="x", padx=12, pady=10)
 
+        # ── Autonomous Claude section ─────────────────────────────────────
+        tk.Label(win, text="AUTONOMOUS CLAUDE (optional strategy)",
+                 bg=C["card"], fg=C["gold"],
+                 font=("Segoe UI", 9, "bold"), anchor="w").pack(
+                     fill="x", padx=16, pady=(0, 4))
+
+        _claude_status_msg = (
+            "Select the 🧠 Autonomous Claude strategy in the main panel "
+            "to route each tick's decisions through the Claude API.\n"
+            "Env var ANTHROPIC_API_KEY takes priority; field below is "
+            "a fallback stored in your data dir."
+        )
+        tk.Label(win, text=_claude_status_msg, bg=C["card"], fg=C["dim"],
+                 font=("Segoe UI", 8), anchor="w", justify="left",
+                 wraplength=380).pack(fill="x", padx=16, pady=(0, 8))
+
+        claude_grid = tk.Frame(win, bg=C["card"])
+        claude_grid.pack(fill="x", padx=16)
+
+        tk.Label(claude_grid, text="API key:", bg=C["card"], fg=C["dim"],
+                 font=("Segoe UI", 9), anchor="w").grid(
+                     row=0, column=0, sticky="w", pady=4)
+
+        if not hasattr(self, "_claude_key_var"):
+            # Seed with whatever's on disk (NOT env var — we don't want to
+            # overwrite the file with a live env value by accident).
+            try:
+                from claude_strategy import load_api_key as _lk
+                # load_api_key returns env-or-file; for display we want
+                # to distinguish.  Simpler: just read the file directly.
+                import os as _os_s
+                _key_path = "anthropic_key.txt"
+                _initial_key = ""
+                if _os_s.path.isfile(_key_path):
+                    try:
+                        with open(_key_path, "r", encoding="utf-8") as _kf:
+                            _initial_key = _kf.read().strip()
+                    except Exception:
+                        _initial_key = ""
+            except Exception:
+                _initial_key = ""
+            self._claude_key_var = tk.StringVar(value=_initial_key)
+        self._claude_key_show = tk.BooleanVar(value=False)
+
+        key_entry = tk.Entry(claude_grid, textvariable=self._claude_key_var,
+                             show="●", width=32, font=("Consolas", 9),
+                             bg=C["card_alt"], fg=C["text"],
+                             insertbackground=C["text"], relief="flat")
+        key_entry.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=4)
+
+        def _toggle_show():
+            key_entry.config(show="" if self._claude_key_show.get() else "●")
+        tk.Checkbutton(claude_grid, text="show", variable=self._claude_key_show,
+                       command=_toggle_show, bg=C["card"], fg=C["dim"],
+                       selectcolor=C["card_alt"], font=("Segoe UI", 8),
+                       activebackground=C["card"], bd=0).grid(
+                           row=0, column=2, sticky="w", padx=(4, 0))
+
+        # Budget + today's spend display
+        try:
+            from claude_strategy import (
+                budget_today_usd as _bt, CLAUDE_BUDGET_DAILY_USD as _cap
+            )
+            today_spent = _bt()
+            pct = min(100, int(100 * today_spent / max(0.01, _cap)))
+            budget_text = f"Today: ${today_spent:.2f} / ${_cap:.2f}  ({pct}% used)"
+        except Exception:
+            budget_text = "Today: $0.00 / $5.00"
+        tk.Label(win, text=budget_text, bg=C["card"], fg=C["text"],
+                 font=("Segoe UI", 9), anchor="w").pack(
+                     fill="x", padx=16, pady=(10, 2))
+
+        tk.Label(win, text="(budget resets at local midnight; strategy "
+                           "auto-disables when cap is reached and falls back "
+                           "to decide_v2)",
+                 bg=C["card"], fg=C["dim"],
+                 font=("Segoe UI", 8), anchor="w", justify="left",
+                 wraplength=380).pack(fill="x", padx=16, pady=(0, 8))
+
+        tk.Frame(win, bg=C["border"], height=1).pack(fill="x", padx=12, pady=10)
+
         def _save_and_close():
+            # Persist Claude API key (if any) before saving the rest
+            try:
+                from claude_strategy import save_api_key as _sk
+                k = (self._claude_key_var.get() or "").strip()
+                if k:
+                    _sk(k)
+            except Exception as _e:
+                messagebox.showerror("Claude key", f"Failed to save API key: {_e}")
             self._save_settings()
             win.destroy()
 

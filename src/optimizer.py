@@ -162,6 +162,103 @@ def read_live_header(page) -> dict:
     return out
 
 
+# ── Fort page scrape (shared between read_state + scrape_fort_stats) ────────
+# Multiple extraction strategies, tried in order — any one yielding a number
+# wins for that field.  Prevents the "Fort: 100/100" silent failure when
+# DarkThrone tweaks the /fort page layout or label wording.
+#
+#   1. Labeled .fort-stat-box containers — original, fast, exact
+#   2. Regex on the flattened page text — tolerates class renames as long
+#      as the visible text still says "Current Health" / "Maximum Health"
+#      (or even just a lone "X / Y" pair near "HP")
+#   3. data-* attributes on progress bars — last-resort, survives even
+#      a DOM rewrite as long as the game still renders the HP bar widget
+#
+# The r object starts at zeros so callers can detect "not scraped" vs
+# "really at 0 HP (destroyed fort)" — the old hp:100 default masked bugs.
+_FORT_SCRAPE_JS = r"""
+() => {
+    const r = {hp: 0, max_hp: 0, fort_lv: 0, cost_per_hp: 16.75};
+
+    // Strategy 1: labelled boxes (canonical layout)
+    document.querySelectorAll('.fort-stat-box').forEach(box => {
+        const label = (box.querySelector('.fort-stat-label')?.innerText || '').trim();
+        const val   = (box.querySelector('.fort-stat-value')?.innerText || '').trim();
+        const n = parseInt(val.replace(/[^0-9]/g, '')) || 0;
+        if (/current\s*health/i.test(label))             r.hp      = n;
+        else if (/max(?:imum)?\s*health/i.test(label))   r.max_hp  = n;
+        else if (/^\s*fortification\s*$/i.test(label))   r.fort_lv = n;
+    });
+
+    // Strategy 2: regex on the full page text (handles class renames)
+    if (!r.hp || !r.max_hp) {
+        const bodyText = (document.body.innerText || '').replace(/\s+/g, ' ');
+        // Pattern A: "Current Health ... N"  or  "Health: N"
+        if (!r.hp) {
+            const m = bodyText.match(/current\s*(?:fort\s*)?health[^\d]{0,30}(\d[\d,]*)/i);
+            if (m) r.hp = parseInt(m[1].replace(/,/g, '')) || 0;
+        }
+        if (!r.max_hp) {
+            const m = bodyText.match(/max(?:imum)?\s*(?:fort\s*)?health[^\d]{0,30}(\d[\d,]*)/i);
+            if (m) r.max_hp = parseInt(m[1].replace(/,/g, '')) || 0;
+        }
+        // Pattern B: "N / M HP"  (fallback for either order of labels)
+        if (!r.hp || !r.max_hp) {
+            const m = bodyText.match(/(\d[\d,]{0,8})\s*\/\s*(\d[\d,]{0,8})\s*(?:HP|health)/i);
+            if (m) {
+                const a = parseInt(m[1].replace(/,/g, '')) || 0;
+                const b = parseInt(m[2].replace(/,/g, '')) || 0;
+                if (!r.hp     && a > 0 && a <= b) r.hp     = a;
+                if (!r.max_hp && b > 0)           r.max_hp = b;
+            }
+        }
+        // Fort level fallback — "Fortification Lv N" or "Fortification: N"
+        if (!r.fort_lv) {
+            const m = bodyText.match(/fortification\s*(?:lv|level|:)?\s*(\d{1,2})/i);
+            if (m) r.fort_lv = parseInt(m[1]) || 0;
+        }
+    }
+
+    // Strategy 3: data-* attributes on HP bar (survives DOM rewrites)
+    if (!r.hp) {
+        const el = document.querySelector(
+            '[data-fort-hp], [data-current-hp], [data-hp]'
+        );
+        if (el) {
+            const v = parseInt(
+                el.getAttribute('data-fort-hp') ||
+                el.getAttribute('data-current-hp') ||
+                el.getAttribute('data-hp') || '0'
+            );
+            if (v) r.hp = v;
+        }
+    }
+    if (!r.max_hp) {
+        const el = document.querySelector(
+            '[data-fort-max], [data-max-hp], [data-hp-max]'
+        );
+        if (el) {
+            const v = parseInt(
+                el.getAttribute('data-fort-max') ||
+                el.getAttribute('data-max-hp') ||
+                el.getAttribute('data-hp-max') || '0'
+            );
+            if (v) r.max_hp = v;
+        }
+    }
+
+    // cost_per_hp is hardcoded in the page JS — pull it so the repair
+    // cost estimate is exact, not our 16.75 constant.
+    const scripts = Array.from(document.scripts).map(s => s.innerText || s.textContent);
+    for (const sc of scripts) {
+        const m = sc.match(/costPerHp\s*=\s*([\d.]+)/);
+        if (m) { r.cost_per_hp = parseFloat(m[1]); break; }
+    }
+    return r;
+}
+"""
+
+
 # ── Read full game state ───────────────────────────────────────────────────────
 def read_state(page):
     # ── 1. OVERVIEW — combat stats, economy, level, XP, gear Arsenal counts ──
@@ -440,29 +537,30 @@ def read_state(page):
     # ── 6. FORT — current HP, max HP, fort level ──────────────────────────────
     page.goto(f"{BASE_URL}/fort")
     page.wait_for_load_state("networkidle", timeout=10000)
-    fort_js = page.evaluate("""() => {
-        const r = {hp: 100, max_hp: 100, fort_lv: 0, cost_per_hp: 16.75};
-        document.querySelectorAll('.fort-stat-box').forEach(box => {
-            const label = (box.querySelector('.fort-stat-label')?.innerText || '').trim();
-            const val   = (box.querySelector('.fort-stat-value')?.innerText || '').trim();
-            const n = parseInt(val.replace(/[^0-9]/g,'')) || 0;
-            if (label.includes('Current Health'))      r.hp       = n;
-            else if (label.includes('Maximum Health')) r.max_hp   = n;
-            else if (label.includes('Fortification'))  r.fort_lv  = n;
-        });
-        // cost_per_hp is hardcoded in the page JS
-        const scripts = Array.from(document.scripts).map(s => s.innerText || s.textContent);
-        for (const sc of scripts) {
-            const m = sc.match(/costPerHp\\s*=\\s*([\\d.]+)/);
-            if (m) { r.cost_per_hp = parseFloat(m[1]); break; }
-        }
-        return r;
-    }""")
+    fort_js = page.evaluate(_FORT_SCRAPE_JS)
     s["fort_hp"]      = fort_js["hp"]
     s["fort_max_hp"]  = fort_js["max_hp"]
     s["fort_pct"]     = round(fort_js["hp"] / max(fort_js["max_hp"], 1) * 100)
     s["fort_lv"]      = fort_js["fort_lv"]
     s["cost_per_hp"]  = fort_js["cost_per_hp"]
+    # Diagnostic dump when the scrape clearly failed — hp / max_hp both zero
+    # (or the hardcoded default 100/100 sneaks through).  Dumps the page
+    # HTML so label/layout drift on DT's side is debuggable without a
+    # live repro.  The JS tries three strategies in order (labeled boxes,
+    # regex on page text, data-* attributes); if none yields a number,
+    # something has changed and we need to update selectors.
+    if not (fort_js["hp"] and fort_js["max_hp"]):
+        try:
+            _unhide("debug_fort_page.html")
+            with open("debug_fort_page.html", "w", encoding="utf-8") as _df:
+                _df.write(f"<!-- URL: {page.url} -->\n")
+                _df.write(f"<!-- scrape returned: {fort_js} -->\n")
+                _df.write(page.content() or "")
+            print(f"     ⚠️  Fort scrape returned hp={fort_js['hp']} "
+                  f"max_hp={fort_js['max_hp']} (defaults); HTML dumped to "
+                  f"debug_fort_page.html for inspection")
+        except Exception:
+            pass
 
     # ── 7. BANK — deposit count + max deposit allowed this transaction ────────
     page.goto(f"{BASE_URL}/bank")
@@ -1085,7 +1183,304 @@ def decide_v2(s, cats, strategy=None):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def _try_pre_plan_execute(page, live_gold: int, state_hint: dict | None = None) -> dict:
+    """Predictive-mode fast path.  Called at tick start BEFORE the slow
+    scrape cycle.  If a saved claude_next_plan.json exists AND is fresh
+    AND its expected_start_gold is within PLAN_VARIANCE_THRESHOLD of
+    actual live gold, execute the plan's actions immediately — gold
+    gets spent/banked within 5-10s of the tick firing, compressing the
+    "exposed-gold" window that attackers exploit.
+
+    Returns a dict with:
+      executed        : bool — did we run the pre-plan?
+      actions_run     : int  — how many landed
+      actions_planned : int  — how many were in the plan
+      skip_reason     : str  — why we bailed (if executed=False)
+      gold_final      : int  — live gold after the fast-execute (or input if skipped)
+
+    Side effects:
+      * invalidates the plan on disk (so next tick doesn't re-run it)
+      * uses the shared execute() helper so verify_spent semantics apply
+    """
+    result = {"executed": False, "actions_run": 0, "actions_planned": 0,
+              "skip_reason": "", "gold_final": live_gold}
+    try:
+        from claude_strategy import (
+            load_next_plan, invalidate_next_plan, plan_variance_ok,
+        )
+    except Exception as e:
+        result["skip_reason"] = f"claude_strategy import failed: {e}"
+        return result
+
+    plan = load_next_plan()
+    if not plan:
+        result["skip_reason"] = "no_plan_or_stale"
+        return result
+
+    raw_actions = plan.get("actions") or []
+    result["actions_planned"] = len(raw_actions)
+    if not raw_actions:
+        result["skip_reason"] = "plan_has_no_actions"
+        invalidate_next_plan()
+        return result
+
+    ok, variance = plan_variance_ok(plan, live_gold)
+    if not ok:
+        result["skip_reason"] = (
+            f"variance_too_high ({variance:.0%}) expected "
+            f"{plan.get('expected_start_gold', 0):,}g got {live_gold:,}g"
+        )
+        # Discard the stale plan — synchronous decide will take over.
+        invalidate_next_plan()
+        return result
+
+    # Plan is viable — decorate + affordability-gate + execute
+    # state_hint may be None (we haven't scraped yet).  Pass a minimal
+    # shim so _decorate_claude_action has the fields it touches.
+    state = state_hint or {}
+    state["gold"] = live_gold
+    # buildings_meta is scrape-time data we don't have yet at tick start.
+    # If a BUILD action appears in the pre-plan, _decorate returns None
+    # (no live cost available) and it gets dropped gracefully — not ideal
+    # but rare: Claude's BUILD forecasts are usually accompanied by
+    # banking/training actions that don't need the scrape.
+    decorated: list = []
+    for ra in raw_actions:
+        da = _decorate_claude_action(ra, state, upgrades_buyable=None)
+        if da is not None:
+            decorated.append(da)
+
+    # Cumulative-cost filter (same as the synchronous path)
+    def _act_cost(a: dict) -> int:
+        t = a.get("type")
+        if t == "BANK":        return int(a.get("amount", 0) or 0)
+        if t == "BUY_GEAR":    return int(a.get("total",  0) or 0)
+        if t == "BUY_UPGRADE": return int(a.get("total",  0) or 0)
+        return int(a.get("cost", 0) or 0)
+    safe: list = []
+    running = 0
+    for a in decorated:
+        c = _act_cost(a)
+        if running + c > live_gold:
+            print(f"     ⚠️  Pre-plan action dropped (unaffordable): "
+                  f"{a.get('type')} cost {c:,}, running total {running + c:,} "
+                  f"> live gold {live_gold:,}")
+            continue
+        safe.append(a)
+        running += c
+
+    if not safe:
+        result["skip_reason"] = "no_affordable_pre_plan_actions"
+        invalidate_next_plan()
+        return result
+
+    print(f"  ⚡ PRE-PLAN FAST EXECUTE: {len(safe)} action(s) from last tick's "
+          f"forecast (expected {plan.get('expected_start_gold', 0):,}g, "
+          f"live {live_gold:,}g, variance {variance:.1%})")
+    for a in safe:
+        icon = {"BUILD":"🏗️","BUY_GEAR":"⚔️","UPGRADE_GEAR":"⬆️","TRAIN":"🪖",
+                "BANK":"🏦","REPAIR_FORT":"🛡️","BUY_UPGRADE":"⬆️"}.get(a["type"], "•")
+        print(f"     {icon} [{a['type']}] {a.get('reason','')[:110]}")
+
+    # Execute — execute() handles verify_spent per action + counts succeeded/failed
+    gold_after = execute(page, safe, live_gold)
+    # How many actually landed (gold went down)?
+    # execute() already prints the succeeded/failed tally; just capture final.
+    result["executed"]    = True
+    result["actions_run"] = len(safe)   # approximate; execute has the exact count
+    result["gold_final"]  = int(gold_after or 0)
+
+    # Always invalidate so next tick starts fresh (Claude will save a
+    # new plan when it runs after the full scrape below).
+    invalidate_next_plan()
+    return result
+
+
+def _decorate_claude_action(a: dict, state: dict, upgrades_buyable: dict | None = None,
+                             cats: list | None = None) -> dict | None:
+    """Fill in the exact cost/total/name/tab fields that execute()'s helpers
+    expect.  Claude emits actions with human intent (unit + tier + qty),
+    the runtime looks up the real in-game prices here so Claude never has
+    to memorize tables.  Returns a decorated copy, or None if the action
+    can't be decorated (e.g. unknown building name, unreachable tier).
+
+    Mutates a copy, not the input dict, so the original can be logged
+    verbatim in the memo.
+
+    `cats` (from analyse()) enables the BUY_GEAR pre-flight: when the
+    player already owns >= unit_count weapons/armor for the target slot,
+    the server silently refuses the buy.  Detecting that here skips the
+    wasted page-load.  The pre-plan path (which runs before the scrape)
+    passes cats=None and must rely on server-side rejection.
+    """
+    # Defense-in-depth normalizer — catches drifted shapes from Claude's
+    # pre-plan (which doesn't pass through validate_actions).  No-op on
+    # already-canonical actions.
+    try:
+        from claude_strategy import normalize_claude_action as _norm
+        a = _norm(a)
+    except Exception:
+        a = dict(a)  # shallow copy so we don't corrupt Claude's memo
+    t = a.get("type")
+    a.setdefault("reason", "")
+
+    if t == "TRAIN":
+        unit = a.get("unit")
+        count = int(a.get("count", 0) or 0)
+        cost_per = UNIT_COST.get(unit)
+        if not cost_per or count <= 0:
+            return None
+        a["cost"] = cost_per * count
+        return a
+
+    if t == "BUY_GEAR":
+        unit = a.get("unit")
+        slot = a.get("slot")
+        tier = int(a.get("tier", 0) or 0)
+        qty  = int(a.get("qty", 0) or 0)
+        if not unit or not slot or qty <= 0:
+            return None
+        table = GEAR.get((unit, slot))
+        if not table or tier not in table:
+            return None
+        # Pre-flight: if the target slot is already saturated (weapons or
+        # armor owned >= unit count), DarkThrone silently refuses the buy.
+        # Detect locally so we don't burn a page-load per tick.
+        if cats is not None:
+            owned_key = "w_owned" if slot == "weapon" else "a_owned"
+            for c in cats:
+                if c.get("unit") != unit:
+                    continue
+                units_ct = int(c.get("units", 0) or 0)
+                owned_ct = int(c.get(owned_key, 0) or 0)
+                if units_ct > 0 and owned_ct >= units_ct:
+                    print(f"     ⏭️  BUY_GEAR skipped: {unit} {slot} slot "
+                          f"full ({owned_ct}/{units_ct}) — server would "
+                          f"refuse.  Train more {unit}s first, or upgrade "
+                          f"tier via sell-then-buy (not currently supported).")
+                    return None
+                break
+        name, stat, cost_per = table[tier]
+        a["name"]  = name
+        a["total"] = cost_per * qty
+        a["cost"]  = cost_per           # per-item, for logging uniformity
+        a["tab"]   = ARMORY_TAB.get(unit, "")
+        return a
+
+    if t == "BUILD":
+        name = a.get("name")
+        lv   = int(a.get("lv", 0) or 0)
+        if not name or lv <= 0:
+            return None
+        # Exact cost from the live /buildings page scrape.  The game's
+        # scaling isn't strictly linear (Barracks Lv2 costs more than
+        # base × 2 for example), so the BUILDINGS table base_cost is a
+        # rough guide and buildings_meta carries the real number.
+        meta = (state.get("buildings_meta") or {}).get(name, {})
+        live_cost = int(meta.get("cost", 0) or 0)
+        # Only propose the build if the game actually shows it as
+        # upgradable AND the next-level matches what Claude picked.
+        # This catches prerequisite gates (e.g. Mine Lv3 needs Fort Lv2)
+        # that aren't encoded in our BUILDINGS base_cost table.
+        if meta:
+            current_lv = int(meta.get("level", 0) or 0)
+            if meta.get("locked"):
+                # Prereqs or level gate not met — don't submit, would 500.
+                return None
+            if lv != current_lv + 1:
+                # Claude targeted a level that isn't the next-up upgrade;
+                # the form on the page only lets you buy the next level.
+                # Rewrite to the next level but keep Claude's reason.
+                lv = current_lv + 1
+                a["lv"] = lv
+            if live_cost > 0:
+                a["cost"] = live_cost
+                return a
+        # Fallback when buildings_meta is missing (first-ever tick, or
+        # scrape failure): linear estimate base × level.  Known to be
+        # imperfect for some buildings.
+        base_cost = None
+        for row in BUILDINGS:
+            if row[0] == name:
+                base_cost = row[2]
+                break
+        if base_cost is None:
+            return None
+        a["cost"] = int(base_cost * lv)
+        return a
+
+    if t == "BUY_UPGRADE":
+        name = a.get("name")
+        qty  = int(a.get("qty", 0) or 0)
+        if not name or qty <= 0:
+            return None
+        # upgrades_buyable is a dict name → cost (from read_state).  If
+        # the upgrade is not currently buyable (locked or owned-out), we
+        # still pass the action through but with unknown cost; execute()
+        # will gracefully bail with "not found on page" if it can't be
+        # clicked.  This avoids Claude getting stuck if its view of the
+        # available upgrades is out of sync.
+        cost = int((upgrades_buyable or {}).get(name, 0) or 0)
+        a["total"] = cost * qty
+        a["cost"]  = cost
+        return a
+
+    if t == "REPAIR_FORT":
+        damage = int(a.get("damage", 0) or 0)
+        if damage <= 0:
+            return None
+        per_hp = float(state.get("fort_cost_per_hp", 16.75) or 16.75)
+        a["cost"] = int(damage * per_hp)
+        return a
+
+    if t == "BANK":
+        amount = int(a.get("amount", 0) or 0)
+        if amount <= 0:
+            return None
+        # _bank reads max cap from the page itself; we don't need a cost
+        # field — execute() tracks spend via live header read.
+        return a
+
+    return None   # unknown type (should already have been filtered by validator)
+
+
 # ── EXECUTE ACTIONS ────────────────────────────────────────────────────────────
+def _verify_spent(page, gold_before: int, action_tag: str, action_name: str):
+    """Read the live header gold AFTER a form submit and decide if the action
+    actually landed on the server.
+
+    The `form.submit()` JS we fire only tells us that a submit *event* was
+    dispatched.  The browser navigates either way — on server-side rejection
+    (rate limit, session race, silent validation fail, stale form token) the
+    page still loads and `submitted` returns True, but our gold didn't move.
+    Trusting the "submitted" boolean made the optimizer log '4/4 succeeded'
+    while in-game gold sat untouched; that's the bug this helper prevents.
+
+    Returns (gold_after, succeeded).  gold_after is the authoritative live
+    value — callers should use it as their in-memory tracker going forward,
+    not the computed (gold - cost) value.  succeeded is True only when gold
+    actually decreased (action really landed)."""
+    try:
+        gold_after = int(read_live_header(page).get("gold", 0) or 0)
+    except Exception as _e:
+        print(f"      ⚠️  {action_tag} post-submit header read failed ({_e}) — "
+              f"assuming failure, keeping gold at {gold_before:,}")
+        return gold_before, False
+    if gold_after <= 0:
+        # Header parsing totally broken — be conservative, don't assume spend.
+        print(f"      ⚠️  {action_tag} {action_name}: live header read gold=0 "
+              f"(header selectors broken?) — keeping gold at {gold_before:,}")
+        return gold_before, False
+    if gold_after < gold_before:
+        log(action_tag, action_name, gold_before, gold_after)
+        return gold_after, True
+    # Gold unchanged (or went UP somehow — e.g. a tick fired mid-action).
+    # Treat as silent failure so the caller doesn't count it as success.
+    print(f"      ❌ {action_tag} {action_name}: gold unchanged "
+          f"({gold_before:,} → {gold_after:,}) — server rejected silently")
+    return gold_after, False
+
+
 def execute(page, actions, gold):
     succeeded = 0
     failed    = 0
@@ -1155,6 +1550,7 @@ def _build(page, a, gold):
     try:
         page.goto(f"{BASE_URL}/buildings")
         page.wait_for_selector(".building-card", timeout=10000)
+        gold_pre = int(read_live_header(page).get("gold", gold) or gold)
         hidden = page.query_selector(f"input[name='building_type_id'][value='{btype_id}']")
         if hidden:
             btn = hidden.evaluate_handle(
@@ -1167,8 +1563,9 @@ def _build(page, a, gold):
                     return gold
                 with page.expect_navigation(wait_until="networkidle", timeout=15000):
                     btn.click()
-                log("BUILD", f"{a['name']} Lv{a['lv']}", gold, gold - a["cost"])
-                return gold - a["cost"]
+                gold_after, _ok = _verify_spent(page, gold_pre, "BUILD",
+                                                f"{a['name']} Lv{a['lv']}")
+                return gold_after
         print(f"      ⚠️  building_type_id={btype_id} not found on page")
     except Exception as e:
         print(f"      ⚠️  Build error: {e}")
@@ -1183,6 +1580,7 @@ def _buy_gear(page, a, gold):
     try:
         page.goto(f"{BASE_URL}/armory")
         page.wait_for_selector(".armory-page", timeout=15000)
+        gold_pre = int(read_live_header(page).get("gold", gold) or gold)
         js = f"""() => {{
             const buyBtn = document.querySelector('.mode-btn[data-mode="buy"]');
             if (buyBtn && !buyBtn.classList.contains('active')) buyBtn.click();
@@ -1203,8 +1601,9 @@ def _buy_gear(page, a, gold):
         with page.expect_navigation(wait_until="networkidle", timeout=15000):
             submitted = page.evaluate(js)
         if submitted:
-            log("GEAR", f"{a['qty']}×{a['name']} T{a['tier']}", gold, gold - a["total"])
-            return gold - a["total"]
+            gold_after, _ok = _verify_spent(page, gold_pre, "GEAR",
+                                            f"{a['qty']}×{a['name']} T{a['tier']}")
+            return gold_after
         print(f"      ⚠️  item_id={item_id} not found in armory")
     except Exception as e:
         print(f"      ⚠️  Gear error: {e}")
@@ -1235,6 +1634,7 @@ def _train(page, a, gold):
     try:
         page.goto(f"{BASE_URL}/train")
         page.wait_for_load_state("networkidle", timeout=10000)
+        gold_pre = int(read_live_header(page).get("gold", gold) or gold)
         uid = UNIT_ID[a["unit"]]
         js = f"""() => {{
             const multiBtn = document.querySelector('.buy-mode-btn[data-mode="multi"]');
@@ -1254,8 +1654,9 @@ def _train(page, a, gold):
         with page.expect_navigation(wait_until="networkidle", timeout=15000):
             submitted = page.evaluate(js)
         if submitted:
-            log("TRAIN", f"{a['count']}×{a['unit']}", gold, gold - a["cost"])
-            return gold - a["cost"]
+            gold_after, _ok = _verify_spent(page, gold_pre, "TRAIN",
+                                            f"{a['count']}×{a['unit']}")
+            return gold_after
         print(f"      ⚠️  Input not found for unit_id={uid}")
     except Exception as e:
         print(f"      ⚠️  Train error: {e}")
@@ -1265,6 +1666,7 @@ def _bank(page, a, gold):
     try:
         page.goto(f"{BASE_URL}/bank")
         page.wait_for_load_state("networkidle", timeout=10000)
+        gold_pre = int(read_live_header(page).get("gold", gold) or gold)
         js = f"""() => {{
             const inp = document.querySelector('#deposit_amount, input[name="amount"]');
             if (!inp) return {{ok: false, amount: 0}};
@@ -1283,8 +1685,8 @@ def _bank(page, a, gold):
         if result["ok"]:
             actual = result["amount"]
             print(f"    🏦 Banked {actual:,}g — {a['reason']}")
-            log("BANK", f"{actual:,}g", gold, gold - actual)
-            return gold - actual
+            gold_after, _ok = _verify_spent(page, gold_pre, "BANK", f"{actual:,}g")
+            return gold_after
     except Exception as e:
         print(f"      ⚠️  Bank error: {e}")
     return gold
@@ -1294,16 +1696,10 @@ def _repair_fort(page, a, gold):
     try:
         page.goto(f"{BASE_URL}/fort")
         page.wait_for_load_state("networkidle", timeout=10000)
-        submitted = page.evaluate(f"""() => {{
-            const inp = document.getElementById('repairAmount');
-            if (!inp) return false;
-            inp.value = '{a["damage"]}';
-            inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-            const form = inp.closest('form');
-            if (!form) return false;
-            form.submit();
-            return true;
-        }}""")
+        gold_pre = int(read_live_header(page).get("gold", gold) or gold)
+        # Fire a SINGLE submit (the old double-evaluate was a cut/paste relic
+        # that double-submitted every repair — the server ignored the second,
+        # but it still wasted a full page-load cycle).
         with page.expect_navigation(wait_until="networkidle", timeout=15000):
             submitted = page.evaluate(f"""() => {{
                 const inp = document.getElementById('repairAmount');
@@ -1316,8 +1712,9 @@ def _repair_fort(page, a, gold):
                 return true;
             }}""")
         if submitted:
-            log("FORT_REPAIR", f"{a['damage']} HP", gold, gold - a["cost"])
-            return gold - a["cost"]
+            gold_after, _ok = _verify_spent(page, gold_pre, "FORT_REPAIR",
+                                            f"{a['damage']} HP")
+            return gold_after
     except Exception as e:
         print(f"      ⚠️  Fort repair error: {e}")
     return gold
@@ -1327,6 +1724,7 @@ def _buy_upgrade(page, a, gold):
     try:
         page.goto(f"{BASE_URL}/upgrades")
         page.wait_for_load_state("networkidle", timeout=10000)
+        gold_pre = int(read_live_header(page).get("gold", gold) or gold)
         js = f"""() => {{
             let target = null;
             document.querySelectorAll('.buy-mode tr:not(.disabled)').forEach(row => {{
@@ -1348,8 +1746,9 @@ def _buy_upgrade(page, a, gold):
         with page.expect_navigation(wait_until="networkidle", timeout=15000):
             submitted = page.evaluate(js)
         if submitted:
-            log("UPGRADE", f"{a['qty']}×{a['name']}", gold, gold - a["total"])
-            return gold - a["total"]
+            gold_after, _ok = _verify_spent(page, gold_pre, "UPGRADE",
+                                            f"{a['qty']}×{a['name']}")
+            return gold_after
         print(f"      ⚠️  Upgrade '{a['name']}' not found on page")
     except Exception as e:
         print(f"      ⚠️  Upgrade error: {e}")
@@ -1685,6 +2084,92 @@ def run_tick():
             browser.close()
             return
 
+        # ── FAST-EXECUTE PHASE (predictive + emergency fallback) ─────────
+        # Step 1: in Claude mode, try to execute the pre-plan Claude made
+        #         during last tick's wait window.  If it's fresh and the
+        #         live gold matches the forecast, we spend/bank within
+        #         ~5-10s of tick fire — a tight race against attackers
+        #         who scan the attack list seconds after the tick.
+        # Step 2: if pre-plan didn't execute (no plan, stale, variance
+        #         too high), fall back to the emergency-bank heuristic:
+        #         if live gold > EMERGENCY_BANK_GOLD, deposit a chunk
+        #         immediately.  At least hide the gold from plunderers.
+        # Step 3: the slow scrape + synchronous decide path runs AFTER
+        #         both of those, as normal.
+        _hdr = read_live_header(page)
+        _live_gold = int(_hdr.get("gold", 0) or 0)
+
+        # Step 1: predictive pre-plan (Claude mode only)
+        _pre_plan_result = {"executed": False}
+        try:
+            _strategy_key_probe = (load_strategy() or "").strip().lower()
+            if _strategy_key_probe == "claude-auto":
+                _pre_plan_result = _try_pre_plan_execute(page, _live_gold, state_hint=None)
+                if _pre_plan_result.get("executed"):
+                    # Gold may have dropped substantially — re-read for the
+                    # emergency-bank check below.
+                    _live_gold = int(read_live_header(page).get("gold", 0) or 0)
+                elif _pre_plan_result.get("skip_reason"):
+                    _sr = _pre_plan_result["skip_reason"]
+                    if _sr != "no_plan_or_stale":   # chatty; silence on first run
+                        print(f"  ℹ️  Pre-plan skipped: {_sr}")
+        except Exception as _pp_err:
+            print(f"  ⚠️  Pre-plan phase error: {_pp_err} — continuing with emergency-bank")
+
+        # Step 2: emergency-bank fallback (fires in both Claude and heuristic modes)
+        try:
+            if _live_gold >= EMERGENCY_BANK_GOLD:
+                print(f"  ⚡ Emergency-bank phase: {_live_gold:,}g on hand exceeds "
+                      f"{EMERGENCY_BANK_GOLD:,}g threshold — moving to bank first.")
+                page.goto(f"{BASE_URL}/bank")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                # Read the form's max cap so we don't over-propose.
+                # On busy ticks DT sometimes rate-limits the UI — if the
+                # input isn't there, we just skip and continue normally.
+                _bank_result = page.evaluate(f"""() => {{
+                    const inp = document.querySelector('#deposit_amount, input[name="amount"]');
+                    if (!inp) return {{ok: false, reason: 'input_missing'}};
+                    const cap = parseInt(inp.getAttribute('max') || '0');
+                    if (cap < 10000) return {{ok: false, reason: 'cap_too_small', cap}};
+                    // Deposit the FULL cap — maximum protection per slot used.
+                    inp.value = cap;
+                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    const form = inp.closest('form');
+                    if (!form) return {{ok: false, reason: 'no_form'}};
+                    form.submit();
+                    return {{ok: true, amount: cap}};
+                }}""")
+                if _bank_result.get("ok"):
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    _after = read_live_header(page).get("gold", _live_gold)
+                    _banked = max(0, _live_gold - int(_after or 0))
+                    if _banked > 0:
+                        print(f"     🏦 Emergency-banked {_banked:,}g  "
+                              f"(now {_after:,}g on hand)")
+                    else:
+                        print(f"     ⚠️  Emergency-bank submit fired but gold "
+                              f"unchanged ({_live_gold:,}g) — likely daily slot "
+                              f"cap already used.")
+                else:
+                    _reason = _bank_result.get("reason", "unknown")
+                    if _reason == "cap_too_small":
+                        print(f"     ℹ️  Emergency-bank skipped: daily slot cap "
+                              f"reached (form max={_bank_result.get('cap',0):,}g).")
+                    else:
+                        print(f"     ⚠️  Emergency-bank skipped: {_reason}")
+            # If gold is under the threshold, no action — the normal tick
+            # cycle will handle the smaller amount via TRAIN / BUILD / BANK
+            # planning without needing to burn a deposit slot prematurely.
+        except Exception as _eb_err:
+            print(f"  ⚠️  Emergency-bank phase failed: {_eb_err} — proceeding with normal tick")
+        # ── END fast-bank ──────────────────────────────────────────────────
+
         s = read_state(page)
         print(f"  💰 Gold: {s['gold']:,} | Bank: {s['bank']:,} | Citizens: {s['citizens']} | Turns: {s.get('turns',0):,}")
         print(f"  ⚔️  ATK: {s['atk']:,} | DEF: {s['def']:,} | SpyOff: {s['spy_off']:,} | SpyDef: {s['spy_def']:,}")
@@ -1709,29 +2194,155 @@ def run_tick():
                   f"max_tier=T{c['max_t']} {status}")
         print()
 
-        # Decide — marginal-value engine.
-        actions, gold_after = decide_v2(s, cats)
-        print("  🧠 DECISIONS:")
-        for a in actions:
-            icon = {"BUILD":"🏗️","BUY_GEAR":"⚔️","UPGRADE_GEAR":"⬆️","TRAIN":"🪖",
-                    "BANK":"🏦","REPAIR_FORT":"🛡️","BUY_UPGRADE":"⬆️",
-                    "SAVE_FOR_BUILD":"💾","SAVE_FOR_GEAR":"💾",
-                    "SAVE_FOR_UPGRADE":"💾","SAVE_FOR_REPAIR":"💾"}.get(a["type"],"•")
-            print(f"     {icon} [{a['type']}] {a.get('reason','')}")
-        print()
+        # ── Decide + Execute with retry ──────────────────────────────────────
+        # Gold on hand is attack bait — other players can plunder it.  If
+        # an execution pass leaves significant gold unspent (silent server
+        # rejections, stale forms, race conditions), re-read state + re-plan
+        # + re-execute.  Each retry starts from CURRENT live state so any
+        # partial success from the previous pass is accounted for, and the
+        # planner can pick different actions if the first set didn't land.
+        MAX_SPEND_RETRIES   = 3          # hard cap to avoid infinite loops
+        MIN_GOLD_TO_RETRY   = 10_000     # below this, not worth another pass
+        all_actions: list   = []         # accumulated across retries (for growth log)
+        gold                = s["gold"]  # initial starting gold
+        orig_gold           = s["gold"]  # for final delta report
+        last_gold           = gold
 
-        # Execute
-        gold = execute(page, actions, s["gold"])
+        # Detect Claude-driven strategy — the "claude-auto" profile bypasses
+        # decide_v2's hardcoded weights and calls the Claude API to reason
+        # from game mechanics.  Falls back to decide_v2 on any failure
+        # (missing key, budget exceeded, API error, parse failure).
+        _strategy_key = _normalize_strategy_key(load_strategy())
+        _use_claude   = (load_strategy() or "").strip().lower() == "claude-auto"
 
-        # Growth log + chart
-        record_growth(s, st["ticks"], actions)
+        for attempt in range(MAX_SPEND_RETRIES):
+            # Pick action source: Claude (free-form reasoning) or decide_v2
+            # (hand-tuned heuristic).  Claude is called ONLY on the first
+            # attempt per tick — retries reuse decide_v2 for cost control
+            # (each API call is ~$0.01-0.05, and the retry is typically
+            # needed for partial execution failures where decide_v2 can
+            # re-plan the remainder fine without burning another API call).
+            actions = []
+            claude_info = None
+            if _use_claude and attempt == 0:
+                try:
+                    from claude_strategy import decide_claude, load_rivals_top10
+                    rivals = load_rivals_top10()
+                    raw_actions, _memo, claude_info = decide_claude(
+                        s, cats, rivals_top10=rivals,
+                        tick_num=st.get("ticks", 0),
+                        log_fn=lambda m, _t="info": print(m),
+                    )
+                    # Decorate Claude's actions with exact costs/names/tabs
+                    # that execute() needs.  Drops entries that can't be
+                    # priced (unknown building, out-of-range tier).
+                    _upgrades_buyable = s.get("upgrades_buyable", {}) or {}
+                    decorated: list = []
+                    for ra in raw_actions:
+                        da = _decorate_claude_action(ra, s, _upgrades_buyable, cats=cats)
+                        if da is not None:
+                            decorated.append(da)
+                        else:
+                            print(f"     ⚠️  Claude action skipped (can't price or slot-full): {ra}")
+
+                    # Cumulative-cost gate: drop tail actions whose running
+                    # total would exceed our gold.  Claude sometimes gets
+                    # scaling math wrong (e.g. "Fort Lv2 costs 500k" when
+                    # the real cost is 500k × lv = 1M) — client-side math
+                    # here prevents wasted page submits for unaffordable
+                    # actions that'd otherwise log as "gold unchanged".
+                    def _act_cost(a: dict) -> int:
+                        t = a.get("type")
+                        if t == "BANK":        return int(a.get("amount", 0) or 0)
+                        if t == "BUY_GEAR":    return int(a.get("total",  0) or 0)
+                        if t == "BUY_UPGRADE": return int(a.get("total",  0) or 0)
+                        return int(a.get("cost", 0) or 0)
+                    actions = []
+                    running_cost = 0
+                    avail = int(s.get("gold", 0) or 0)
+                    for a in decorated:
+                        c = _act_cost(a)
+                        if running_cost + c > avail:
+                            print(f"     ⚠️  Claude action dropped (unaffordable): "
+                                  f"{a.get('type')} cost {c:,}, "
+                                  f"running total would be {running_cost + c:,} "
+                                  f"vs {avail:,} gold available — "
+                                  f"'{(a.get('reason') or '')[:80]}'")
+                            continue
+                        actions.append(a)
+                        running_cost += c
+                    if len(actions) < len(decorated):
+                        print(f"     💰 {len(actions)}/{len(decorated)} Claude actions "
+                              f"fit the {avail:,} gold budget "
+                              f"(planned spend {running_cost:,})")
+                except Exception as _claude_err:
+                    print(f"  ⚠️  Claude strategy error: {_claude_err} — falling back to decide_v2")
+                    actions = []
+
+            # decide_v2 fallback (also the path for non-claude strategies
+            # and for retry passes under Claude mode)
+            if not actions:
+                actions, _ = decide_v2(s, cats)
+            if not actions:
+                if attempt == 0:
+                    print("  ℹ️  No actions proposed — nothing to spend gold on right now.")
+                break
+
+            if attempt == 0:
+                if claude_info:
+                    # In Claude mode the weight-based _strategy_key is
+                    # meaningless (normalize maps unknown→grow).  Label
+                    # with the actual driver so the log is honest.
+                    print("  🧠 DECISIONS (🧠 Autonomous Claude):")
+                else:
+                    print(f"  🧠 DECISIONS (strategy={_strategy_key}):")
+            else:
+                # On a retry, the Claude path is already exhausted for
+                # this tick — we're running decide_v2 as the retry engine.
+                print(f"  🔄 Retry {attempt+1}/{MAX_SPEND_RETRIES}: "
+                      f"{gold:,}g still on hand — re-planning with decide_v2 "
+                      f"(strategy={_strategy_key})")
+            for a in actions:
+                icon = {"BUILD":"🏗️","BUY_GEAR":"⚔️","UPGRADE_GEAR":"⬆️","TRAIN":"🪖",
+                        "BANK":"🏦","REPAIR_FORT":"🛡️","BUY_UPGRADE":"⬆️",
+                        "SAVE_FOR_BUILD":"💾","SAVE_FOR_GEAR":"💾",
+                        "SAVE_FOR_UPGRADE":"💾","SAVE_FOR_REPAIR":"💾"}.get(a["type"],"•")
+                print(f"     {icon} [{a['type']}] {a.get('reason','')}")
+            print()
+
+            gold = execute(page, actions, gold)
+            all_actions.extend(actions)
+
+            # Exit conditions
+            if gold < MIN_GOLD_TO_RETRY:
+                break                           # spent almost everything — done
+            if gold >= last_gold:
+                # No decrement at all this pass — retrying with the same
+                # state would just fail the same way.  Stop before spinning.
+                print(f"  ⚠️  No gold progress this pass (still {gold:,}g) — aborting retries")
+                break
+            last_gold = gold
+
+            # Refresh state for next retry — gold went down partially, so
+            # some actions landed and state has moved (pop, army counts,
+            # building levels, etc.) since the original read_state() call.
+            if attempt < MAX_SPEND_RETRIES - 1:
+                s = read_state(page)
+                cats = analyse(s)
+
+        # Growth log + chart — use the ORIGINAL pre-tick state + every action
+        # we executed across all retry passes.
+        s_for_log = dict(s); s_for_log["gold"] = orig_gold
+        record_growth(s_for_log, st["ticks"], all_actions)
+        actions = all_actions   # expose to downstream code below
 
         # Summary — gold_before vs gold_after shows real spending
-        gold_spent = s["gold"] - gold
+        gold_spent = orig_gold - gold
         if gold_spent > 0:
-            print(f"  💰 Gold spent this tick: {gold_spent:,}  (had {s['gold']:,} → {gold:,} left)")
+            print(f"  💰 Gold spent this tick: {gold_spent:,}  (had {orig_gold:,} → {gold:,} left)")
         elif actions:
-            print(f"  ⚠️  {len(actions)} action(s) planned but 0 gold spent — executors may have failed")
+            print(f"  ⚠️  {len(actions)} action(s) planned but 0 gold spent — "
+                  f"check executor warnings above")
 
         if s["xp_need"] > 0:
             left = s["xp_need"]-s["xp"]; ticks = left/60
@@ -2269,6 +2880,17 @@ BATTLE_TICK_BUFFER_SECONDS = 90
 ATTACK_LIMIT_RE = re.compile(r"\((\d+)\s*/\s*5\)")
 SPY_LIMIT_RE    = re.compile(r"(\d+)\s*/\s*5")
 
+# Gold above this at tick start triggers an immediate bank deposit BEFORE
+# the full scrape + decide + execute cycle runs.  Attackers can hit us
+# within seconds of a tick fire; the full cycle takes 60-120s which is
+# plenty of time to be plundered.  This threshold trades off:
+#   too low  → burn all 6 daily deposit slots on small-gold ticks
+#   too high → leave attack bait on the table every tick
+# 500k is roughly one big player's attack-plunder yield — below it the
+# plunder ROI is usually not worth the attacker's turns, so we don't
+# panic-bank.  Above it we always bank first.
+EMERGENCY_BANK_GOLD = 500_000
+
 # Daily max per target — both attacks and spies cap at 5 per day, per game.
 BATTLE_DAILY_MAX = 5
 
@@ -2614,6 +3236,14 @@ def scrape_spy_candidates(page, max_pages: int = 5) -> list:
               const tds  = tr.querySelectorAll('td');
               const level = tds[1] ? parseInt((tds[1].innerText || '').trim()) : 0;
               const race  = tds[2] ? (tds[2].innerText || '').trim()           : '';
+              // Relationship badges — same CSS class pattern as the attack
+              // list so the same skip_friends / skip_clan / skip_hitlist
+              // filters work on spy mode too.  Previously these were all
+              // hardcoded to false in Python, which meant skip_clan never
+              // fired on spy targets and we'd happily spy our own clanmates.
+              const is_clan    = !!tr.querySelector('.clan-badge');
+              const is_friend  = !!tr.querySelector('.friend-badge');
+              const is_hitlist = !!tr.querySelector('.hitlist-badge');
               // Recon button carries the daily counter: "1/5 today"
               const reconBtn = tr.querySelector(
                 'form[action*="/spy/"] button[title*="today"]');
@@ -2625,7 +3255,8 @@ def scrape_spy_candidates(page, max_pages: int = 5) -> list:
               const hasForm = !!tr.querySelector(
                 'form[action*="/spy/"][class*="inline"]');
               if (name && pid && hasForm && !disabled) {
-                out.push({pid, name, level, race, spy_count});
+                out.push({pid, name, level, race, spy_count,
+                          is_clan, is_friend, is_hitlist});
               }
             });
             return out;
@@ -2662,9 +3293,13 @@ def scrape_spy_candidates(page, max_pages: int = 5) -> list:
                 "fort_max":     0,
                 "in_range":     True,
                 "is_bot":       "[bot]" in e["name"].lower(),
-                "is_clan":      False,
-                "is_friend":    False,
-                "is_hitlist":   False,
+                # Relationship badges — now actually scraped (see JS above).
+                # pick_battle_targets honors skip_clan / skip_friends /
+                # skip_hitlist for spy mode only when these are accurate;
+                # hardcoding to False made those filters no-ops.
+                "is_clan":      bool(e.get("is_clan", False)),
+                "is_friend":    bool(e.get("is_friend", False)),
+                "is_hitlist":   bool(e.get("is_hitlist", False)),
                 # Re-use the attack_count field name so pick_battle_targets
                 # can apply the same <5 filter without branching.
                 "attack_count": int(e["spy_count"]),
@@ -2839,12 +3474,15 @@ def pick_battle_targets(rows: list, estimates: dict, our_stats: dict,
         elif farm_mode == "xp":
             # Estimate XP gain per attack. DarkThrone awards more XP when
             # the target is higher-level than you, so target_level - our_level
-            # is a good proxy. Floor at 1 so equal/lower-level targets still
-            # rank above nothing. Secondary sort is est_def DESC (harder
-            # fights at the same level give more XP), then gold.
+            # is a good proxy.  Game range is ±10 levels, so we add 10 as
+            # the offset — target 10 below us → score 1 (worst in-range),
+            # equal level → 10, target 10 above us → 21 (best in-range).
+            # Floor at 1 just in case an out-of-range row slipped through
+            # the filter.  Secondary sort is est_def DESC (harder fights
+            # at the same level give more XP), then gold.
             for t in safe:
                 tl = int(t.get("level", 0) or 0)
-                t["xp_score"] = max(1, tl - our_level + 5)
+                t["xp_score"] = max(1, tl - our_level + 10)
             safe.sort(key=lambda x: (
                 -x.get("xp_score", 0),
                 -int(x.get("est_def", 0) or 0),
@@ -3239,9 +3877,15 @@ def parse_spy_report(page) -> dict:
     has_stat_block = bool(re.search(
         r"Total\s+Offense\s+[\d,]+\s+Total\s+Defense\s+[\d,]+", text))
 
-    if fresh_success or (historical and has_stat_block):
+    # spy_ok requires a real stat block — NOT just a success banner.  DT
+    # sometimes renders the success wrapper for reports where the sentries
+    # intercepted enough info to return the banner but not enough to reveal
+    # the combat stats, and previously we'd trust the banner, record a row
+    # with 'no numbers', and happily count the mission as a win.  Require
+    # both signals: the success header AND the populated stat table.
+    if (fresh_success or historical) and has_stat_block:
         out["result"] = "spy_ok"
-    elif re.search(r"(operation|spy|recon)\s+(failed|unsuccessful)|caught|detected|alerted", text, re.I):
+    elif re.search(r"(operation|spy|recon)\s+(failed|unsuccessful)|caught|detected|alerted|intercepted", text, re.I):
         out["result"] = "spy_fail"
     else:
         out["result"] = "unknown"
@@ -4499,6 +5143,13 @@ def do_spy(page, target: dict, log_fn, dry_run: bool = False) -> dict:
     # Harvest intel from the spy report — this is the GOLD MINE.  A
     # successful recon reveals every combat stat and unit count, which we
     # feed straight back into private_intel.csv for the next calibration.
+    # parse_spy_report ALSO sets a stricter result than _parse_battle_result
+    # — it only returns 'spy_ok' when a real stat block is present, which
+    # is the authoritative signal.  Use it to overwrite res["result"] so
+    # battle_loop's win/fail counters don't mis-classify a failed spy (where
+    # the page contains loose matches for "intelligence" + "complete"
+    # elsewhere in the HTML) as a successful one.
+    intel = {}
     try:
         intel = parse_spy_report(page)
         intel.setdefault("target_name", name)
@@ -4506,19 +5157,29 @@ def do_spy(page, target: dict, log_fn, dry_run: bool = False) -> dict:
     except Exception as e:
         log_fn(f"  ⚠️  intel parse failed for {name}: {e}", "dim")
 
+    # Stricter result wins — parse_spy_report requires a stat block for
+    # spy_ok, so if we have no stats we know the spy didn't actually land.
+    intel_result = (intel or {}).get("result")
+    if intel_result in ("spy_ok", "spy_fail"):
+        res["result"] = intel_result
+
     post_hdr = read_live_header(page)
     gold_after = post_hdr.get("gold", 0) or gold_before
 
-    _battle_log_row("spy", pid, name, SPY_TURNS_COST, gold_before, gold_after,
-                    0, res.get("result", "unknown"))
-
     result = res.get("result", "unknown")
-    if result == "spy_ok" or result == "unknown":
+    _battle_log_row("spy", pid, name, SPY_TURNS_COST, gold_before, gold_after,
+                    0, result)
+
+    if result == "spy_ok":
         log_fn(f"  🔍 {name}: recon ok  (now {gold_after:,}g)", "battle")
     elif result == "spy_fail":
         log_fn(f"  🔍 {name}: recon failed — spy defense too high", "red")
     else:
-        log_fn(f"  🔍 {name}: {result}", "battle")
+        # Unknown → treat as a soft failure (don't claim recon_ok on a
+        # page we couldn't classify).  Counted as neither win nor loss
+        # by battle_loop.
+        log_fn(f"  🔍 {name}: result unclear ('{result}') — "
+               f"assuming spy didn't land, not counting as success", "dim")
     return res
 
 
@@ -5603,29 +6264,16 @@ def scrape_player_profiles(page, ts, force_refresh=False, scan_up_to=500):
 
 
 def scrape_fort_stats(page, ts):
-    """Scrape fort HP, max HP, fort level and repair cost (same as optimizer)."""
+    """Scrape fort HP, max HP, fort level and repair cost.  Uses the shared
+    robust _FORT_SCRAPE_JS (multiple extraction strategies) so the two
+    entry points (read_state + this) can't drift from each other — if DT
+    changes the /fort page, only the one module-level constant needs
+    updating."""
     print("  🛡️ Scraping fort stats...")
     try:
         page.goto(f"{BASE_URL}/fort")
         page.wait_for_load_state("networkidle", timeout=10000)
-
-        fort_js = page.evaluate("""() => {
-            const r = {hp: 0, max_hp: 0, fort_lv: 0, cost_per_hp: 16.75};
-            document.querySelectorAll('.fort-stat-box').forEach(box => {
-                const label = (box.querySelector('.fort-stat-label')?.innerText || '').trim();
-                const val   = (box.querySelector('.fort-stat-value')?.innerText || '').trim();
-                const n = parseInt(val.replace(/[^0-9]/g,'')) || 0;
-                if (label.includes('Current Health'))      r.hp       = n;
-                else if (label.includes('Maximum Health')) r.max_hp   = n;
-                else if (label.includes('Fortification'))  r.fort_lv  = n;
-            });
-            const scripts = Array.from(document.scripts).map(s => s.innerText || s.textContent);
-            for (const sc of scripts) {
-                const m = sc.match(/costPerHp\\s*=\\s*([\\d.]+)/);
-                if (m) { r.cost_per_hp = parseFloat(m[1]); break; }
-            }
-            return r;
-        }""")
+        fort_js = page.evaluate(_FORT_SCRAPE_JS)
 
         hp       = fort_js["hp"]
         max_hp   = fort_js["max_hp"]
@@ -5639,7 +6287,24 @@ def scrape_fort_stats(page, ts):
             ["Timestamp", "FortHP", "FortMaxHP", "FortPct", "FortLevel", "CostPerHP", "DamageHP", "RepairCost"],
             [[ts, hp, max_hp, pct, fort_lv, cpp, dmg, repair_c]]
         )
-        print(f"     ✅ Fort {hp}/{max_hp} HP ({pct}%) Lv={fort_lv} damage={dmg} repair_cost={repair_c:,}g")
+        if not (hp and max_hp):
+            # Same diagnostic pattern as read_state — make label/layout
+            # drift visible immediately instead of burying it in a stats
+            # file that reads 0/0 for days before anyone notices.
+            try:
+                _unhide("debug_fort_page.html")
+                with open("debug_fort_page.html", "w", encoding="utf-8") as _df:
+                    _df.write(f"<!-- URL: {page.url} -->\n")
+                    _df.write(f"<!-- scrape returned: {fort_js} -->\n")
+                    _df.write(page.content() or "")
+            except Exception:
+                pass
+            print(f"     ⚠️  Fort scrape returned hp={hp} max_hp={max_hp} "
+                  f"(zero = selectors likely broken) — HTML dumped to "
+                  f"debug_fort_page.html")
+        else:
+            print(f"     ✅ Fort {hp}/{max_hp} HP ({pct}%) Lv={fort_lv} "
+                  f"damage={dmg} repair_cost={repair_c:,}g")
     except Exception as e:
         print(f"     ⚠️ Fort stats failed: {e}")
 
@@ -7430,16 +8095,15 @@ CONFIRMED_STATS = {
             'spy_def': '2026-04-17',
         },
     },
-    # DEF was re-confirmed 2026-04-15 via Discord screenshot from the
-    # player (handle 'Ragnawar'): "Top def is mine: 530k". The other
+    # DEF was re-confirmed 2026-04-17 via fresh intel: 654k.  The other
     # combat stats are still from the April 8 profile screenshot — too
     # old to anchor the rank curves for atk/spy but still useful as
     # floors. Per-stat verified_at so only def is fed to calibration.
     'Radagon Of The Golden Order': {
         'level': 18, 'race': 'Goblin', 'cls': 'Cleric',
-        'atk':  9_611, 'def': 530_000, 'spy_off': 4_226, 'spy_def': 3_760,
+        'atk':  9_611, 'def': 654_000, 'spy_off': 4_226, 'spy_def': 3_760,
         'verified_at': {
-            'def': '2026-04-15',   # fresh — Discord confirmation
+            'def':     '2026-04-17',   # fresh
             'atk':     '2026-04-08',
             'spy_off': '2026-04-08',
             'spy_def': '2026-04-08',
